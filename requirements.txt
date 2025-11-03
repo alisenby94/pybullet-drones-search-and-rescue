@@ -1,0 +1,32 @@
+# SAR Planner Requirements
+# Core dependencies for LLM-based search and rescue mission planning
+
+# Deep Learning / LLM
+torch>=2.0.0
+transformers>=4.30.0
+accelerate>=0.20.0  # Required for model loading
+huggingface_hub  # For model authentication
+
+# Fine-tuning (for transfer learning)
+peft>=0.4.0  # LoRA and parameter-efficient fine-tuning
+datasets>=2.12.0  # Dataset utilities
+
+# Numeric and scientific computing
+numpy>=1.24.0
+
+# Optional: For optimization (uncomment if needed)
+# bitsandbytes>=0.41.0  # For 8-bit quantization
+# sentencepiece>=0.1.99  # For Llama tokenizer
+
+# Development and testing
+pytest>=7.4.0
+pytest-cov>=4.1.0
+
+# Visualization (for future)
+matplotlib>=3.7.0
+plotly>=5.14.0
+
+# PyBullet drone simulation (when ready for integration)
+# gym-pybullet-drones
+# pybullet>=3.2.5
+# gymnasium>=0.28.0
