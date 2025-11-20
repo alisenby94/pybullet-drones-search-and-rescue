@@ -26,7 +26,12 @@ pytest-cov>=4.1.0
 matplotlib>=3.7.0
 plotly>=5.14.0
 
-# PyBullet drone simulation (when ready for integration)
-# gym-pybullet-drones
-# pybullet>=3.2.5
-# gymnasium>=0.28.0
+# PyBullet drone simulation and RL training
+pybullet>=3.2.5
+gymnasium>=0.28.0
+stable-baselines3>=2.0.0  # RL algorithms (PPO, SAC, etc.)
+tensorboard>=2.13.0  # For training monitoring
+transforms3d>=0.4.1  # 3D transformations
+scipy>=1.10.0
+
+# gym-pybullet-drones is included in simulation/ folder

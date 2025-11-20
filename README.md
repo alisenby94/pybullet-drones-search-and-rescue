@@ -33,6 +33,7 @@ The LLM learns optimal planning strategies through reward feedback from the MDP 
 
 ## Quick Start
 
+### LLM Planner
 ```bash
 # Setup environment
 python -m venv .venv
@@ -42,6 +43,58 @@ pip install -r requirements.txt
 # Test LLM planner
 python test_sar_planner.py
 ```
+
+### RL Simulation Environment
+
+**NEW!** Train RL agents in a procedurally generated environment:
+
+```bash
+# One-command setup
+./setup_simulation.sh
+
+# Test environment with visualization
+python test_sar_env.py --mode full
+
+# Train RL agent (1M steps)
+python train_sar_agent.py --mode train --timesteps 1000000
+
+# Monitor training
+tensorboard --logdir ./logs
+```
+
+See [`simulation/README.md`](simulation/README.md) for details.
+
+**Key Features:**
+- 🎲 **Procedural obstacles** (trees, buildings) - agent can't memorize!
+- 🌲 **Poisson disk sampling** for natural placement
+- 🎯 **Random waypoint navigation**
+- 🧠 **PPO training** with curriculum learning
+
+### Low-Level Velocity Controller
+
+**NEW!** 4D body-frame velocity control for precise flight:
+
+```bash
+# Quick reference
+./quick_ref_4d.sh
+
+# Test environment (no training needed)
+python test_4d_body_frame.py
+
+# Train velocity controller (200k steps, ~2-3 hours)
+./train_4d_velocity.sh
+
+# Visualize trained model
+python visualize_velocity_control.py --model models/velocity_4d_body_frame_v1/best_model.zip
+```
+
+**Control Architecture:**
+- **dx, dy, dz**: Linear velocity in drone body frame (forward/back, left/right, up/down)
+- **rz**: Yaw rate (rotation about Z-axis)
+- **Observation space**: 11D (reduced from 15D)
+- **Curriculum learning**: Hover → gentle → active movement
+
+See [`BODY_FRAME_CONTROL.md`](BODY_FRAME_CONTROL.md) and [`SETUP_COMPLETE.md`](SETUP_COMPLETE.md) for details.
 
 ## Technologies
 
