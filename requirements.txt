@@ -33,5 +33,7 @@ stable-baselines3>=2.0.0  # RL algorithms (PPO, SAC, etc.)
 tensorboard>=2.13.0  # For training monitoring
 transforms3d>=0.4.1  # 3D transformations
 scipy>=1.10.0
+tqdm>=4.65.0  # Progress bars
+rich>=13.0.0  # Rich text and beautiful formatting
 
 # gym-pybullet-drones is included in simulation/ folder

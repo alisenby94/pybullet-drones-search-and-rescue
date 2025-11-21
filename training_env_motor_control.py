@@ -25,7 +25,8 @@ OUTPUT:
 """
 
 import sys
-sys.path.insert(0, '/home/illicit/Repos/pybullet-drones-search-and-rescue/simulation/gym-pybullet-drones')
+import os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'simulation', 'gym-pybullet-drones'))
 
 import numpy as np
 from gymnasium import spaces
@@ -167,9 +168,9 @@ class MotorControlAviary(BaseRLAviary):
         Returns:
             RPM commands [0, MAX_RPM]^4
         """
-        max_offset = 0.3 * self.HOVER_RPM
-        offset = np.array(action).reshape(4) * max_offset
-        rpm = (self.HOVER_RPM + offset).reshape(1, 4)
+        # 5% variation around hover (same as gym-pybullet-drones HoverAviary)
+        # action=0 -> HOVER_RPM, action=+1 -> 1.05*HOVER_RPM, action=-1 -> 0.95*HOVER_RPM
+        rpm = np.array(self.HOVER_RPM * (1 + 0.05 * action)).reshape(1, 4)
         rpm = np.clip(rpm, 0, self.MAX_RPM)
         return rpm
     
