@@ -1,107 +1,82 @@
-#!/usr/bin/env python3
 """
-Quick test of stereo vision system without GUI
-"""
-import sys
-sys.path.insert(0, '/home/illicit/Repos/pybullet-drones-search-and-rescue/simulation/gym-pybullet-drones')
+Test Stereovision System
 
+Usage: python test_stereo_vision.py [--gui] [--stream]
+"""
+import argparse
 import numpy as np
+import time
 import pybullet as p
-from stereo_vision import StereoVisionSystem, StereoConfig
+from src.envs.action_coordinator_env import ActionCoordinatorEnv
 
-def main():
-    print("="*70)
-    print("STEREO VISION SYSTEM - QUICK TEST")
-    print("="*70)
+
+def test_stereo_vision(gui=False, enable_streaming=False):
+    print("="*60)
+    print("STEREOVISION SYSTEM TEST")
+    print("="*60)
     
-    # Start PyBullet in DIRECT mode (no GUI)
-    client = p.connect(p.DIRECT)
-    p.setGravity(0, 0, -9.81)
+    env = ActionCoordinatorEnv(gui=gui, enable_vision=True, enable_streaming=enable_streaming)
+    obs, info = env.reset()
     
-    # Add ground plane
-    plane_shape = p.createCollisionShape(p.GEOM_PLANE)
-    plane_id = p.createMultiBody(0, plane_shape)
+    # Add a red cube obstacle 1 meter in front of the drone (straight ahead in +X direction)
+    # Since drone starts at yaw=0, +X is forward
+    drone_pos = np.array([0.0, 0.0, 1.75])  # Known initial position
+    obstacle_x = drone_pos[0] + 1.0  # 1m in front (drone's +X direction)
+    obstacle_y = drone_pos[1]
+    obstacle_z = drone_pos[2]  # Same height as drone
     
-    # Add some box objects at different distances
-    box_shape = p.createCollisionShape(p.GEOM_BOX, halfExtents=[0.5, 0.5, 0.5])
-    box1 = p.createMultiBody(1, box_shape, basePosition=[2, 0, 0.5])
-    box2 = p.createMultiBody(1, box_shape, basePosition=[5, 1, 0.5])
-    box3 = p.createMultiBody(1, box_shape, basePosition=[8, -1, 0.5])
-    
-    print("\n✓ Created test environment with 3 boxes at distances: 2m, 5m, 8m")
-    
-    # Create stereo vision system
-    config = StereoConfig(
-        baseline=0.1,  # 10cm between cameras
-        img_width=128,
-        img_height=128,
-        fov=60.0
+    # Create cube (0.3m x 0.3m x 0.3m) - using p.connect default (assumes single physics server)
+    collision_shape = p.createCollisionShape(p.GEOM_BOX, halfExtents=[0.15, 0.15, 0.15])
+    visual_shape = p.createVisualShape(
+        p.GEOM_BOX,
+        halfExtents=[0.15, 0.15, 0.15],
+        rgbaColor=[1.0, 0.0, 0.0, 1.0]  # Bright red
     )
-    stereo = StereoVisionSystem(config)
+    obstacle_id = p.createMultiBody(
+        baseMass=0,  # Static obstacle
+        baseCollisionShapeIndex=collision_shape,
+        baseVisualShapeIndex=visual_shape,
+        basePosition=[obstacle_x, obstacle_y, obstacle_z]
+    )
     
-    print(f"\n✓ Initialized stereo vision system:")
-    print(f"    Baseline: {config.baseline}m")
-    print(f"    Image size: {config.img_width}x{config.img_height}")
-    print(f"    FOV: {config.fov}°")
-    print(f"    Focal length: {config.focal_length:.2f} pixels")
+    print(f"\n✅ Added red cube obstacle:")
+    print(f"   Position: ({obstacle_x:.2f}, {obstacle_y:.2f}, {obstacle_z:.2f})")
+    print(f"   Distance from drone: 1.0m (straight ahead)")
+    print(f"   Size: 0.3m × 0.3m × 0.3m\n")
     
-    # Simulate drone at position looking forward
-    drone_pos = np.array([0.0, 0.0, 2.0])
-    drone_quat = np.array([0, 0, 0, 1])  # No rotation (looking along +X axis)
+    # Let physics settle
+    for _ in range(20):
+        p.stepSimulation()
+    time.sleep(0.1)
     
-    print(f"\n✓ Drone position: {drone_pos}")
-    print(f"    Looking along: +X axis")
+    print(f"Observation shape: {obs.shape}")
+    print(f"Expected: (2058,) = 10D sensors + 2048D vision")
     
-    # Test 1: Capture stereo images
-    print("\n[1] Capturing stereo images...")
-    images = stereo.capture_stereo_images(drone_pos, drone_quat, client)
-    
-    print(f"    ✓ Left RGB: {images['left_rgb'].shape}")
-    print(f"    ✓ Right RGB: {images['right_rgb'].shape}")
-    print(f"    ✓ Left Depth: {images['left_depth'].shape}")
-    print(f"    ✓ Right Depth: {images['right_depth'].shape}")
-    
-    # Test 2: Get depth map using PyBullet method
-    print("\n[2] Computing depth map (PyBullet method)...")
-    depth_map, _ = stereo.get_depth_map(drone_pos, drone_quat, client, method='pybullet')
-    
-    print(f"    ✓ Depth map shape: {depth_map.shape}")
-    print(f"    ✓ Depth range: {np.min(depth_map):.2f}m to {np.max(depth_map):.2f}m")
-    print(f"    ✓ Mean depth: {np.mean(depth_map):.2f}m")
-    print(f"    ✓ Median depth: {np.median(depth_map):.2f}m")
-    
-    # Test 3: Generate point cloud
-    print("\n[3] Generating 3D point cloud...")
-    point_cloud = stereo.get_point_cloud(depth_map, images['left_rgb'])
-    
-    print(f"    ✓ Total points: {point_cloud.shape[0]:,}")
-    print(f"    ✓ Data format: {'XYZ + RGB' if point_cloud.shape[1] == 6 else 'XYZ only'}")
-    
-    # Analyze point cloud
-    if point_cloud.shape[0] > 0:
-        distances = np.linalg.norm(point_cloud[:, :3], axis=1)
-        print(f"    ✓ Point distances: {np.min(distances):.2f}m to {np.max(distances):.2f}m")
-    
-    #  Test 4: Try stereo matching if available
-    if stereo.stereo_matcher is not None:
-        print("\n[4] Computing depth with stereo matching...")
-        depth_stereo, _ = stereo.get_depth_map(drone_pos, drone_quat, client, method='stereo')
-        print(f"    ✓ Stereo depth range: {np.min(depth_stereo):.2f}m to {np.max(depth_stereo):.2f}m")
+    if obs.shape[0] == 2058:
+        print("✅ Observation shape correct!")
     else:
-        print("\n[4] Stereo matching not available (OpenCV StereoBM not found)")
+        print(f"❌ Wrong shape! Got {obs.shape}")
+        return False
     
-    print("\n" + "="*70)
-    print("✓ ALL TESTS PASSED!")
-    print("="*70)
-    print("\nStereo vision system is ready to use in your RL environment!")
-    print("\nKey features:")
-    print("  • Dual camera setup with configurable baseline")
-    print("  • Real-time depth map computation")
-    print("  • 3D point cloud generation")
-    print("  • Optional stereo matching for realistic depth estimation")
-    print("="*70)
+    for step in range(50):
+        action = np.zeros(4)
+        obs, reward, terminated, truncated, info = env.step(action)
+        
+        if step % 10 == 0:
+            vision_obs = obs[10:]
+            print(f"Step {step}: reward={reward:.2f}, vision_mean={np.mean(vision_obs):.3f}m")
+        
+        if terminated or truncated:
+            break
     
-    p.disconnect()
+    env.close()
+    print("✅ Test complete!")
+    return True
+
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--gui", action="store_true")
+    parser.add_argument("--stream", action="store_true")
+    args = parser.parse_args()
+    test_stereo_vision(gui=args.gui, enable_streaming=args.stream)
