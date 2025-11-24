@@ -2,24 +2,25 @@
 Action Coordinator Environment (Stage 1)
 
 PURPOSE:
-    Learn high-level navigation by issuing velocity commands.
+    Learn high-level navigation by issuing acceleration commands.
     
 INPUTS:
-    - Current position, velocity, acceleration (9D)
-    - Yaw rate (1D)
-    - Next 3 waypoints relative position (9D)
-    - Previous velocity command (4D)
+    - Current velocity (3D)
+    - Angular velocity (3D)
+    - Vector to waypoint (3D)
     - Tracking compliance metric (1D)
+    - Desired velocity state (4D) - integrator state
+    - Stereovision depth map (512D) - optional
     
 OUTPUTS:
-    - Normalized velocity commands [-1, 1]^4
-    - Scaled to ±1.0 m/s linear, ±π/6 rad/s angular
+    - Normalized acceleration commands [-1, 1]^4
+    - Scaled to ±1.5 m/s² linear, ±π/4 rad/s² angular
     
 REWARD:
     - Progress toward waypoint
-    - Velocity penalty (smooth motion)
-    - Acceleration penalty (avoid jerking)
-    - Extreme command penalty (avoid impossible commands)
+    - Roll/pitch stability
+    - Altitude control
+    - Survival bonus
 """
 
 import sys
@@ -37,8 +38,8 @@ class ActionCoordinatorEnv(BaseRLAviary):
     """
     Stage 1: High-level action coordinator environment.
     
-    Plans velocity commands to navigate through waypoints.
-    Motor controller execution is simulated via PD controller.
+    Plans acceleration commands to navigate through waypoints.
+    Commands are integrated to desired velocities, then PID tracks them.
     """
     
     def __init__(self, gui=False, enable_vision=False, enable_streaming=False, 
@@ -57,11 +58,13 @@ class ActionCoordinatorEnv(BaseRLAviary):
         self.max_episode_steps = 500
         self.current_step = 0
         
-        # Action limits - velocity commands for navigation
-        # action=0 → hover (no velocity), action=±1 → max velocity
-        # Scaled for reasonable navigation speeds while avoiding crashes
-        self.max_linear_vel = 2.0      # m/s (2.0 m/s max - good balance of speed and control)
-        self.max_angular_vel = np.pi / 4  # rad/s (45 deg/s - reasonable turn rate)
+        # Action limits - acceleration commands for navigation
+        # action=0 → maintain current velocity, action=±1 → max acceleration
+        # Scaled for smooth, predictable control
+        self.max_linear_accel = 1.5      # m/s² (1.5 m/s² - smooth, PID-friendly)
+        self.max_angular_accel = np.pi / 4  # rad/s² (45 deg/s² - smooth rotation)
+        self.max_linear_vel = 2.5      # m/s (velocity clipping limit)
+        self.max_angular_vel = np.pi / 2  # rad/s (yaw rate clipping limit)
         
         # Waypoints
         self.waypoints = []
@@ -88,12 +91,13 @@ class ActionCoordinatorEnv(BaseRLAviary):
             from src.vision.stereo_vision import StereoVisionSystem
             self.vision_system = StereoVisionSystem(
                 baseline=0.06,  # 6cm stereo baseline
-                resolution=(640, 480),
-                downsample_size=(64, 32),  # 2048D vision features
+                resolution=(160, 120),  # Reduced from 640x480 for speed
+                downsample_size=(32, 16),  # 512D vision features (reduced from 2048D)
                 enable_streaming=enable_streaming,
-                stream_port=5555
+                stream_port=5555,
+                verbose=False  # Disable debug output during training
             )
-            print(f"[ActionCoordinator] Stereovision enabled (2048D features)")
+            print(f"[ActionCoordinator] Stereovision enabled (512D features, optimized for training)")
             if enable_streaming:
                 print(f"[ActionCoordinator] Video streaming enabled - open in VLC: http://localhost:5555/stream")
         
@@ -142,7 +146,10 @@ class ActionCoordinatorEnv(BaseRLAviary):
     
     def _actionSpace(self):
         """
-        Action: Normalized velocity commands [-1, 1]^4
+        Action: Normalized acceleration commands [-1, 1]^4
+        
+        Commands: [ax, ay, az, yaw_accel] in body frame
+        Integrated to desired velocities, then tracked by PID.
         
         Returns:
             Box space (4,) in range [-1, 1]
@@ -151,30 +158,27 @@ class ActionCoordinatorEnv(BaseRLAviary):
     
     def _observationSpace(self):
         """
-        Observation: Raw sensor data for GRU to learn from
+        Observation: Raw sensor data + integrator state for GRU to learn from
         
-        Components (10D or 2058D depending on vision):
-            Without vision (10D):
+        Components (14D or 526D depending on vision):
+            Without vision (14D):
                 - Velocity (world frame): 3D       (how am I moving?)
                 - Angular velocity (world frame): 3D (how am I rotating?)
                 - Vector to waypoint: 3D            (where to go?)
                 - Tracking compliance: 1D           (is motor responding?)
+                - Desired velocity: 4D              (integrator state - critical for Markov property!)
             
-            With vision (2058D):
-                - Same 10D sensors as above
-                - Stereovision depth map: 2048D (64x32 attention-weighted depth)
+            With vision (526D):
+                - Same 14D sensors as above
+                - Stereovision depth map: 512D (32x16 attention-weighted depth, optimized)
             
-        Philosophy: Feed GRU raw sensor data with minimal preprocessing.
-        Let the 64D hidden state discover optimal features, coordinate transforms,
-        and temporal patterns. Simpler code, no human bias, potentially better performance.
-        
-        No explicit features for altitude, angles, distances - GRU will learn
-        these relationships from the raw vector data if they're important.
+        Philosophy: Include desired_vel so agent can predict effects of acceleration commands.
+        This makes the environment Markovian - agent can learn deterministic dynamics.
             
         Returns:
-            Box space (10,) or (2058,) depending on enable_vision
+            Box space (14,) or (526,) depending on enable_vision
         """
-        obs_size = 2058 if self.enable_vision else 10
+        obs_size = 526 if self.enable_vision else 14
         return spaces.Box(low=-np.inf, high=np.inf, shape=(obs_size,), dtype=np.float32)
     
     def _computeObs(self):
@@ -194,13 +198,14 @@ class ActionCoordinatorEnv(BaseRLAviary):
         # Update previous_vel for reward computation (still needed there)
         self.previous_vel = vel.copy()
         
-        # Construct base observation (10D - raw sensors)
-        # Philosophy: Feed GRU raw data, let it discover optimal features
+        # Construct base observation (14D - raw sensors + integrator state)
+        # Philosophy: Include desired_vel so agent can predict dynamics (Markov property)
         obs = np.concatenate([
             vel,                # 3 - velocity (world frame, natural sensor output)
             ang_vel,            # 3 - angular velocity (world frame, natural sensor output)
             vec_to_waypoint,    # 3 - vector to goal (direction + distance combined)
-            [self.compliance]   # 1 - motor tracking quality (external metric)
+            [self.compliance],  # 1 - motor tracking quality (external metric)
+            self.desired_vel    # 4 - desired velocity (integrator state for predictability)
         ])
         
         # Add vision if enabled (2048D stereo depth with attention)
@@ -216,11 +221,12 @@ class ActionCoordinatorEnv(BaseRLAviary):
     
     def _computeReward(self):
         """
-        Reward: Progress toward waypoint with distance-scaled rewards
+        SPARSE REWARD: Simple pass/fail with minimal shaping
         
-        Main reward is progress (distance reduction), scaled by distance to create
-        urgency gradient: closer to waypoint = higher stakes per meter moved.
-        Uses (4*sech(2*dist) + 1) * 100 scaling function.
+        Philosophy: Let the agent figure out HOW to fly. We just tell it WHAT to achieve.
+        - Big reward for reaching waypoints
+        - Small time penalty (encourages efficiency)
+        - Everything else (attitude, velocity, smoothness) emerges naturally
         
         Returns:
             float: Total reward
@@ -229,50 +235,19 @@ class ActionCoordinatorEnv(BaseRLAviary):
         pos = state[0:3]
         vel = state[10:13]
         
-        # Main reward: DISTANCE-SCALED progress toward current waypoint
-        # The closer to the waypoint, the more valuable each meter of progress
+        # Start with survival bonus (staying alive has value)
+        reward = 1.0
+        
+        # Progress reward: Encourage moving toward waypoint
         current_wp = self.waypoints[self.current_waypoint_idx]
         dist = np.linalg.norm(pos - current_wp)
         prev_dist = np.linalg.norm(self.previous_pos - current_wp)
+        progress = prev_dist - dist
+        reward_progress = 10.0 * progress  # Reward getting closer
+        reward += reward_progress
         
-        # Distance-dependent reward scaling: (4*sech(2x) + 1) * 1.0
-        # sech(x) = 1/cosh(x), creates urgency gradient
-        # At dist=0m: scale ≈ 5.0 (high stakes)
-        # At dist=1m: scale ≈ 1.54 (medium stakes)
-        # At dist=3m: scale ≈ 1.02 (low stakes)
-        reward_scale = (4.0 / np.cosh(2.0 * dist) + 1.0) * 20.0
-        progress = (prev_dist - dist) * reward_scale
-        
-        reward = progress
-        
-        # Direction to waypoint
-        direction_to_wp = (current_wp - pos) / (dist + 1e-6)
-        
-        # Velocity alignment reward: Reward moving toward waypoint at ideal speed
-        # Encourage velocity aligned with direction to goal, capped at ideal velocity
-        vel_align_weight = 0.2
-        vel_toward_wp = np.dot(vel, direction_to_wp)
-        ideal_vel = 0.5  # m/s toward waypoint (moderate, controlled approach)
-        
-        # Reward proportional to velocity toward waypoint, but capped at ideal_vel
-        # If vel_toward_wp <= ideal_vel: reward grows linearly
-        # If vel_toward_wp > ideal_vel: reward capped (no benefit to going faster)
-        base_reward = vel_align_weight * vel_toward_wp
-        reward_vel_align = min(base_reward, vel_align_weight * ideal_vel)
-        reward += reward_vel_align
-        
-        # Lateral velocity penalty: REMOVED
-        # Roll/pitch stability now handles straight flight naturally
-        # Keeping variable for metrics tracking only
-        vel_lateral = vel - vel_toward_wp * direction_to_wp
-        vel_lateral_mag = np.linalg.norm(vel_lateral)
-        reward_lateral = 0.0  # Disabled - roll stability handles this
-        
-        # Acceleration penalty: PRIMARILY LINEAR (encourage smooth motion)
-        accel = (vel - self.previous_vel) / (1.0 / self.control_freq)
-        accel_magnitude = np.linalg.norm(accel)
-        reward_accel = -0.02 * accel_magnitude - 0.002 * accel_magnitude**2
-        reward += reward_accel
+        if dist < self.waypoint_radius:
+            reward += 100.0  # SUCCESS! Found waypoint
         
         # Roll/Pitch stability: Encourage level, forward-facing flight
         # This replaces velocity-based heading alignment with absolute attitude rewards
@@ -283,44 +258,51 @@ class ActionCoordinatorEnv(BaseRLAviary):
         # Roll stability: sech(4*roll) - 1
         # Aggressive penalty for banking left/right
         # roll=0°: 0 (perfect!), roll=±15°: -0.043, roll=±30°: -0.086, roll=±45°: -0.096
-        roll_weight = 10.0
+        roll_weight = 0.5
         reward_roll = (1.0 / np.cosh(4.0 * roll) - 1.0) * roll_weight
         reward += reward_roll
         
-        # Pitch stability: (tanh(12*pitch + π) - 3) / 2 + sech(2*pitch)
+        # Pitch stability: (tanh(12*pitch*π + 5) - 3) / 2 + sech(2*pitch)
         # Asymmetric penalty: heavily punishes backward tilt (positive pitch = nose down)
         # Allows/encourages slight forward tilt (negative pitch = nose up) for forward flight
         # The sech term adds smooth penalty for any pitch deviation
-        pitch_weight = 10.0
-        reward_pitch = ((np.tanh(12.0 * pitch + np.pi + 5) - 3.0) / 2.0 + 
+        pitch_weight = 0.5
+        reward_pitch = ((np.tanh(12.0 * pitch * np.pi + 5) - 3.0) / 2.0 + 
                         1.0 / np.cosh(2.0 * pitch)) * pitch_weight
         reward += reward_pitch
         
-        # Altitude penalty: Moderate - prevent ground crashes to enable exploration
-        # Increased threshold and penalties to keep drone safely airborne
+        # Altitude penalty: Encourage staying near target waypoint altitude
+        # Linear penalty centered on target altitude to discourage vertical exploration
+        target_altitude = current_wp[2]
+        altitude_error = abs(pos[2] - target_altitude)
+        altitude_weight = 0.0  # Moderate weight - don't dominate other rewards
+        reward_altitude = -altitude_weight * altitude_error
+        reward += reward_altitude
+        
+        # Store metrics for logging
+        direction_to_wp = (current_wp - pos) / (dist + 1e-6)
+        vel_toward_wp = np.dot(vel, direction_to_wp)
+        vel_lateral = vel - vel_toward_wp * direction_to_wp
+        vel_lateral_mag = np.linalg.norm(vel_lateral)
+        accel = (vel - self.previous_vel) / (1.0 / self.control_freq)
+        accel_magnitude = np.linalg.norm(accel)
         altitude = pos[2]
-        safe_altitude = 0.8  # Raised from 0.5m - more conservative safety margin
-        reward_altitude = 0.0
-        if altitude < safe_altitude:
-            # Moderate penalties to prevent crashes
-            # Need long episodes for exploration, so make ground scary
-            altitude_error = safe_altitude - altitude
-            reward_altitude = -2.0 * altitude_error - 1.0 * altitude_error**2
-            reward += reward_altitude
         
         # Store components for metrics
         self._progress = progress
+        self._reward_progress = reward_progress
         self._vel_toward_wp = vel_toward_wp
         self._vel_lateral_mag = vel_lateral_mag
         self._accel_magnitude = accel_magnitude
-        self._reward_vel_align = reward_vel_align
-        self._reward_lateral = reward_lateral #disabled due to roll/pitch stability handling this
-        self._reward_accel = reward_accel
+        self._reward_vel_align = 0.0
+        self._reward_lateral = 0.0
+        self._reward_accel = 0.0
         self._roll = roll
         self._pitch = pitch
         self._reward_roll = reward_roll
         self._reward_pitch = reward_pitch
         self._altitude = altitude
+        self._altitude_error = altitude_error
         self._reward_altitude = reward_altitude
         
         # Obstacle proximity penalty (if voxel grid available)
@@ -373,6 +355,7 @@ class ActionCoordinatorEnv(BaseRLAviary):
         # Discount factor handles survival incentive: 0.997^500 ≈ 22% (future rewards still matter)
         
         self.previous_pos = pos.copy()
+        self.previous_vel = vel.copy()
         
         return reward
     
@@ -380,8 +363,8 @@ class ActionCoordinatorEnv(BaseRLAviary):
         """Check if episode should terminate (crash or all waypoints reached)."""
         pos = self._getDroneStateVector(0)[0:3]
         
-        # Ground/ceiling crash
-        if pos[2] < 0.1 or pos[2] > 3.0:
+        # Ground/ceiling crash - much higher ceiling for navigation
+        if pos[2] < 0.1 or pos[2] > 10.0:
             return True
         
         # Out of bounds
@@ -436,21 +419,35 @@ class ActionCoordinatorEnv(BaseRLAviary):
     
     def _preprocessAction(self, action):
         """
-        Convert normalized action to RPM commands via velocity control.
+        Convert normalized acceleration commands to RPM commands.
+        
+        Process:
+        1. Scale action to physical accelerations (body frame)
+        2. Integrate accelerations into desired_vel (explicit integrator)
+        3. Clip desired_vel to safe limits
+        4. PID tracks desired_vel → RPMs
         
         Args:
-            action: Normalized velocity commands [-1, 1]^4
+            action: Normalized acceleration commands [-1, 1]^4
             
         Returns:
             RPM array (1, 4)
         """
-        # Scale normalized action to physical velocities (body frame)
-        self.desired_vel = np.array([
-            action[0] * self.max_linear_vel,
-            action[1] * self.max_linear_vel,
-            action[2] * self.max_linear_vel,
-            action[3] * self.max_angular_vel
+        # Scale normalized action to physical accelerations (body frame)
+        dt = 1.0 / self.control_freq
+        accel_cmd = np.array([
+            action[0] * self.max_linear_accel,
+            action[1] * self.max_linear_accel,
+            action[2] * self.max_linear_accel,
+            action[3] * self.max_angular_accel
         ])
+        
+        # Integrate acceleration into desired velocity (explicit, observable by agent)
+        self.desired_vel += accel_cmd * dt
+        
+        # Clip to safe velocity limits
+        self.desired_vel[:3] = np.clip(self.desired_vel[:3], -self.max_linear_vel, self.max_linear_vel)
+        self.desired_vel[3] = np.clip(self.desired_vel[3], -self.max_angular_vel, self.max_angular_vel)
         
         state = self._getDroneStateVector(0)
         pos = state[0:3]
@@ -469,7 +466,6 @@ class ActionCoordinatorEnv(BaseRLAviary):
         
         # Compute target position for DSL controller (integrate velocity for short horizon)
         # DSL controller expects position target, so we create a virtual target ahead
-        dt = 1.0 / self.control_freq
         target_pos = pos + desired_vel_world * dt * 3  # Look ahead 3 timesteps
         
         # Target yaw rate integration
@@ -510,13 +506,15 @@ class ActionCoordinatorEnv(BaseRLAviary):
         # Initialize empty waypoints so _computeObs() doesn't crash
         self.waypoints = [np.array([0.0, 0.0, 1.75]) for _ in range(5)]
         
+        # Clear old obstacles BEFORE resetting PyBullet world
+        if self.enable_obstacles and self.obstacle_generator is not None:
+            self.obstacle_generator.clear_obstacles()
+        
         # Call super().reset() to initialize PyBullet world
         obs, info = super().reset(seed=seed)
         
         # Now generate obstacles and waypoints (PyBullet world is ready)
         if self.enable_obstacles and self.obstacle_generator is not None:
-            # Clear old obstacles and voxel grid
-            self.obstacle_generator.clear_obstacles()
             
             # Get drone spawn position
             drone_state = self._getDroneStateVector(0)
@@ -596,13 +594,13 @@ class ActionCoordinatorEnv(BaseRLAviary):
         # Crash penalty: Moderate - must enable long exploration episodes
         # Agent needs to stay alive to learn navigation, make crashes costly but not excessive
         if terminated:
-            crash_penalty = -10.0  # Reduced from -1000 to -10 (100× less severe)
+            crash_penalty = -100.0  # Reduced from -1000 to -10 (100× less severe)
             
             # Additional penalty for obstacle collision
             pos = self._getDroneStateVector(0)[0:3]
             if self.enable_obstacles and self.voxel_grid is not None:
                 if self.voxel_grid.is_occupied(pos):
-                    crash_penalty = -20.0  # Double penalty for obstacle crashes!
+                    crash_penalty = -100.0  # Double penalty for obstacle crashes!
                     info['obstacle_crash'] = True
                 else:
                     info['obstacle_crash'] = False

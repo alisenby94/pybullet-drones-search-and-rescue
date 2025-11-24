@@ -12,8 +12,8 @@ import argparse
 import os
 from stable_baselines3 import PPO
 from sb3_contrib import RecurrentPPO
-from stable_baselines3.common.callbacks import CallbackList
-from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv
+from stable_baselines3.common.callbacks import CallbackList, CheckpointCallback
+from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv, VecMonitor
 from tqdm import tqdm
 
 # from src.envs.motor_control_env import MotorControlEnv  # Disabled - not training motor
@@ -21,7 +21,7 @@ from src.envs.action_coordinator_env import ActionCoordinatorEnv
 # from src.arch.rl_arch import create_motor_controller, create_action_coordinator  # Disabled
 from src.arch.rl_arch import create_action_coordinator
 from src.training.metrics import TrainingMetrics
-from src.training.custom_callbacks import DetailedMetricsCallback, PeriodicMetricsCallback
+from src.training.custom_callbacks import WaypointMetricsCallback
 
 
 def train(timesteps=1000000, name="coordinator_v1", coord_seed=None, n_envs=8):
@@ -88,7 +88,7 @@ def train(timesteps=1000000, name="coordinator_v1", coord_seed=None, n_envs=8):
     def make_env():
         """Factory function to create environment instances"""
         def _init():
-            return ActionCoordinatorEnv(gui=False)
+            return ActionCoordinatorEnv(gui=False, enable_vision=True)
         return _init
     
     # Use SubprocVecEnv for true parallelism (separate processes)
@@ -99,6 +99,11 @@ def train(timesteps=1000000, name="coordinator_v1", coord_seed=None, n_envs=8):
     else:
         coord_env = DummyVecEnv([make_env()])
         print(f"  Using single environment (DummyVecEnv)")
+    
+    # Wrap with VecMonitor to aggregate episode stats in main process
+    # This fixes TensorBoard logging with SubprocVecEnv (prevents file lock race)
+    coord_env = VecMonitor(coord_env, info_keywords=())  # Disable info logging to prevent conflicts
+    print(f"  Wrapped with VecMonitor for episode statistics aggregation")
     
     # Create or load coordinator model
     print("Creating coordinator model...")
@@ -120,15 +125,30 @@ def train(timesteps=1000000, name="coordinator_v1", coord_seed=None, n_envs=8):
     else:
         if coord_seed:
             print(f"  Warning: Coordinator seed {coord_seed} not found, creating new model")
-        coord_model = create_action_coordinator(coord_env, verbose=1)  # Enable verbose logging
+        coord_model = create_action_coordinator(coord_env, verbose=2)  # Max verbosity for debugging
+    
+    print(f"  Model tensorboard_log: {coord_model.tensorboard_log}")
+    print(f"  Model verbose: {coord_model.verbose}")
     
     # Initialize metrics
     coord_metrics = TrainingMetrics(stage="coordinator")
     
-    # Create callbacks for detailed metric logging
+    # Create checkpoint callback to save model periodically
+    # Use larger intervals for parallel envs to avoid disk I/O bottleneck
+    checkpoint_callback = CheckpointCallback(
+        save_freq=max(50000 // n_envs, 1000),  # Save every 50k steps (min 1000 to reduce I/O)
+        save_path=f"./models/{name}_checkpoints/",
+        name_prefix="coordinator",
+        save_replay_buffer=False,
+        save_vecnormalize=False,
+        verbose=0  # Disable verbose to reduce console spam
+    )
+    
+    # Create callbacks: checkpoint saving + waypoint metrics
+    # VecMonitor handles episode reward and length automatically
     coord_callbacks = CallbackList([
-        DetailedMetricsCallback(verbose=0),
-        PeriodicMetricsCallback(log_freq=500, verbose=0)
+        checkpoint_callback,
+        WaypointMetricsCallback(verbose=0)
     ])
     
     total_steps = 0
@@ -148,13 +168,17 @@ def train(timesteps=1000000, name="coordinator_v1", coord_seed=None, n_envs=8):
                 coord_env_updated = SubprocVecEnv([make_env() for _ in range(n_envs)])
             else:
                 coord_env_updated = DummyVecEnv([make_env()])
+            
+            # Wrap with VecMonitor for proper logging
+            coord_env_updated = VecMonitor(coord_env_updated, info_keywords=())  # Disable info logging to prevent conflicts
             coord_model.set_env(coord_env_updated)
             
             # Train coordinator
             print(f"  Training with TensorBoard logging to: {coord_model.tensorboard_log}")
+            # Note: reset_num_timesteps must be True for first call to initialize logger
             coord_model.learn(
                 total_timesteps=steps,
-                reset_num_timesteps=False,
+                reset_num_timesteps=(total_steps == 0),  # True for first phase only
                 progress_bar=True,
                 callback=coord_callbacks,
                 tb_log_name=name  # Add run name for TensorBoard

@@ -243,8 +243,8 @@ def create_action_coordinator(env, learning_rate=3e-4, verbose=1, use_recurrent=
                 policy="MlpLstmPolicy",  # Note: Uses LSTM policy class but we configure GRU
                 env=env,
                 learning_rate=learning_rate,
-                n_steps=2048,
-                batch_size=64,
+                n_steps=512,  # Smaller batches = more frequent updates with fresher data
+                batch_size=256,  # Larger mini-batches = more stable gradients, less noise
                 n_epochs=10,
                 gamma=0.997,  # Higher discount = values long-term survival (0.997^500 ≈ 22%)
                 gae_lambda=0.95,

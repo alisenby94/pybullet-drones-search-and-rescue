@@ -4,6 +4,55 @@ import numpy as np
 from stable_baselines3.common.callbacks import BaseCallback
 
 
+class WaypointMetricsCallback(BaseCallback):
+    """
+    Log current waypoint metrics every rollout (don't wait for episode completion).
+    """
+    
+    def __init__(self, verbose=0):
+        super().__init__(verbose)
+        self.rollout_count = 0
+    
+    def _on_step(self) -> bool:
+        """Required by BaseCallback. We do logging in _on_rollout_end instead."""
+        return True
+        
+    def _on_rollout_end(self) -> None:
+        """Log current waypoint metrics from all environments."""
+        self.rollout_count += 1
+        
+        # Get current info from all environments
+        infos = self.locals.get("infos", [])
+        
+        if not isinstance(infos, list):
+            infos = [infos] if infos is not None else []
+        
+        # Collect current metrics from all envs
+        distances = []
+        waypoints_reached = []
+        
+        for info in infos:
+            if info is None:
+                continue
+            
+            if 'waypoint_distance' in info:
+                distances.append(info['waypoint_distance'])
+            
+            if 'waypoints_reached' in info:
+                waypoints_reached.append(info['waypoints_reached'])
+        
+        # Log aggregated metrics
+        if distances:
+            self.logger.record("waypoint/distance_mean", np.mean(distances))
+            self.logger.record("waypoint/distance_min", np.min(distances))
+            self.logger.record("waypoint/distance_max", np.max(distances))
+        
+        if waypoints_reached:
+            self.logger.record("waypoint/reached_mean", np.mean(waypoints_reached))
+            self.logger.record("waypoint/reached_max", np.max(waypoints_reached))
+            self.logger.record("waypoint/reached_total", np.sum(waypoints_reached))
+
+
 class DetailedMetricsCallback(BaseCallback):
     """
     Callback for logging detailed metrics from info dict to TensorBoard.
@@ -30,7 +79,12 @@ class DetailedMetricsCallback(BaseCallback):
         Collects metrics from info dict and logs them when episode ends.
         """
         # Get info from all environments (handles vectorized envs)
+        # For SubprocVecEnv, infos may be a list of dicts or empty
         infos = self.locals.get("infos", [])
+        
+        # Handle case where infos is None or not a list
+        if not isinstance(infos, list):
+            infos = [infos] if infos is not None else []
         
         for idx, info in enumerate(infos):
             if info is None:
@@ -92,6 +146,10 @@ class DetailedMetricsCallback(BaseCallback):
         Called at the end of each rollout (batch collection).
         Log batch-level crash statistics.
         """
+        # Always log, even if batch_episodes is 0 (helps debug SubprocVecEnv issues)
+        self.logger.record("debug/callback_active", 1)
+        self.logger.record("debug/batch_episodes_seen", self.batch_episodes)
+        
         if self.batch_episodes > 0:
             # Update totals
             self.total_episodes += self.batch_episodes
@@ -198,7 +256,14 @@ class PeriodicMetricsCallback(BaseCallback):
         self.step_count += 1
         
         if self.step_count % self.log_freq == 0:
+            # Log that we're actually being called
+            self.logger.record("debug/periodic_callback_steps", self.step_count)
+            
             infos = self.locals.get("infos", [])
+            
+            # Handle case where infos is None or not a list
+            if not isinstance(infos, list):
+                infos = [infos] if infos is not None else []
             
             # Collect current step metrics
             for info in infos:

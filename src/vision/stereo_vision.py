@@ -44,7 +44,8 @@ class StereoVisionSystem:
         far_plane: float = 10.0,  # Far clipping plane
         downsample_size: Tuple[int, int] = (64, 32),  # Downsampled depth map size
         enable_streaming: bool = False,  # Enable video streaming
-        stream_port: int = 5555  # Port for video streaming
+        stream_port: int = 5555,  # Port for video streaming
+        verbose: bool = False  # Enable debug prints and snapshot saving
     ):
         """
         Initialize stereo vision system.
@@ -59,6 +60,7 @@ class StereoVisionSystem:
             downsample_size: Target size for depth map (width, height)
             enable_streaming: Enable RTSP/HTTP streaming for VLC
             stream_port: Port number for streaming server
+            verbose: Enable debug prints and snapshot saving (disable for training)
         """
         self.baseline = baseline
         self.focal_length = focal_length
@@ -67,6 +69,7 @@ class StereoVisionSystem:
         self.near_plane = near_plane
         self.far_plane = far_plane
         self.downsample_size = downsample_size
+        self.verbose = verbose
         
         # Camera offset from drone center (left/right)
         self.camera_offset = baseline / 2.0
@@ -368,8 +371,9 @@ class StereoVisionSystem:
             waypoint_direction
         )
         
-        # Always save debug snapshots (useful for validation)
-        self._save_debug_snapshot(left_img, depth_map, attention_weights, depth_map_small)
+        # Save debug snapshot (only if verbose enabled)
+        if self.verbose:
+            self._save_debug_snapshot(left_img, depth_map, attention_weights, depth_map_small)
         
         # Update streaming buffer if enabled
         if self.enable_streaming:
@@ -413,8 +417,9 @@ class StereoVisionSystem:
                 cv2.COLORMAP_JET
             )
             
-            # Blend RGB with heatmap
-            overlay = cv2.addWeighted(rgb_img, 0.6, heatmap, 0.4, 0)
+            # Blend RGB with heatmap (ensure matching types)
+            rgb_img_uint8 = rgb_img.astype(np.uint8) if rgb_img.dtype != np.uint8 else rgb_img
+            overlay = cv2.addWeighted(rgb_img_uint8, 0.6, heatmap, 0.4, 0)
             
             # Convert depth map to heatmap for visualization (full resolution)
             depth_normalized = (depth_map - np.min(depth_map)) / (np.max(depth_map) - np.min(depth_map) + 1e-8)
@@ -432,8 +437,9 @@ class StereoVisionSystem:
                 downsampled_upscaled = cv2.resize(downsampled_heatmap, (rgb_img.shape[1], rgb_img.shape[0]), interpolation=cv2.INTER_NEAREST)
                 
                 # Create composite image: RGB | Depth Full | Depth Pooled | Attention | Overlay
+                # Ensure all components are uint8 for consistent stacking
                 composite = np.hstack([
-                    rgb_img,
+                    rgb_img_uint8,
                     depth_resized,
                     downsampled_upscaled,
                     cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB),
@@ -441,8 +447,9 @@ class StereoVisionSystem:
                 ])
             else:
                 # Create composite image: RGB | Depth | Attention | Overlay
+                # Ensure all components are uint8 for consistent stacking
                 composite = np.hstack([
-                    rgb_img,
+                    rgb_img_uint8,
                     depth_resized,
                     cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB),
                     overlay
@@ -450,19 +457,10 @@ class StereoVisionSystem:
             
             # Save composite (convert RGB to BGR for cv2)
             filepath = "vision_debug/stereo_vision_snapshot.jpg"
-            success = cv2.imwrite(filepath, cv2.cvtColor(composite, cv2.COLOR_RGB2BGR))
-            
-            if success:
-                print(f"[StereoVision] Saved snapshot to {filepath}")
-                print(f"  - Depth range: {np.min(depth_map):.2f}m to {np.max(depth_map):.2f}m")
-                if depth_map_downsampled is not None:
-                    print(f"  - Pooled depth range: {np.min(depth_map_downsampled):.2f}m to {np.max(depth_map_downsampled):.2f}m")
-                    print(f"  - Pooled shape: {depth_map_downsampled.shape}")
-            else:
-                print(f"[StereoVision] Failed to save snapshot to {filepath}")
+            cv2.imwrite(filepath, cv2.cvtColor(composite.astype(np.uint8), cv2.COLOR_RGB2BGR))
                 
         except Exception as e:
-            print(f"[StereoVision] Error saving snapshot: {e}")
+            pass  # Silently ignore snapshot errors during training
     
     def _update_stream_buffer(
         self,
@@ -491,8 +489,11 @@ class StereoVisionSystem:
             cv2.COLORMAP_JET
         )
         
+        # Ensure both images are uint8 for blending
+        rgb_img_uint8 = rgb_img.astype(np.uint8) if rgb_img.dtype != np.uint8 else rgb_img
+        
         # Blend RGB with heatmap
-        overlay = cv2.addWeighted(rgb_img, 0.6, heatmap, 0.4, 0)
+        overlay = cv2.addWeighted(rgb_img_uint8, 0.6, heatmap, 0.4, 0)
         
         # Update buffer with thread safety
         with self.stream_lock:
