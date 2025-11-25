@@ -6,6 +6,7 @@ The coordinator issues velocity commands which are executed by a PID controller.
 """
 
 import numpy as np
+import argparse
 from src.envs.action_coordinator_env import ActionCoordinatorEnv
 from stable_baselines3 import PPO
 try:
@@ -16,260 +17,208 @@ except ImportError:
     print("Warning: sb3-contrib not installed, cannot load RecurrentPPO models")
 import time
 import pybullet as p
+from pathlib import Path
 
-def test_hierarchical_system():
-    """Test the coordinator agent with PID motor control."""
+def test_hierarchical_system(model_path=None):
+    """Test the trained coordinator agent."""
+    print("\n" + "="*80)
+    print("COORDINATOR AGENT TEST: Waypoint Navigation with Direct RPM Control")
+    print("="*80)
     
-    # Load coordinator model - no motor agent needed (uses PID controller)
-    try:
-        if HAS_RECURRENT:
-            from sb3_contrib import RecurrentPPO as RPPO
-            
-            # Try to load the most recent coordinator model
-            try:
-                coord_model = RPPO.load("models/experiment_v13_checkpoints/coordinator_350000_steps")
-                print("✓ Loaded experiment_v13 coordinator model (RecurrentPPO with GRU + Acceleration)")
-                print("  Control mode: Acceleration commands → PID controller\n")
-            except FileNotFoundError:
-                try:
-                    coord_model = RPPO.load("models/experiment_v12_checkpoints/coordinator_350000_steps")
-                    print("⚠ Loaded experiment_v12 (INCOMPATIBLE - 522D obs vs 526D env)")
-                    print("  This will likely fail. Train v13 with: python -m src.train --timesteps 400000 --name experiment_v13\n")
-                except FileNotFoundError:
-                    try:
-                        coord_model = RPPO.load("models/coordinator_v1_final")
-                        print("⚠ Loaded coordinator_v1 (OLD - velocity commands)")
-                        print("  Control mode: Velocity commands → PID controller\n")
-                    except FileNotFoundError:
-                        print("✗ No coordinator model found!")
-                        print("  Train a model first: python -m src.train --timesteps 400000 --name experiment_v13")
-                        return
-        else:
-            # No recurrent support
-            try:
-                coord_model = PPO.load("models/experiment_v1_final")
-                print("✓ Loaded experiment_v1 coordinator model (PPO)")
-                print("  Motor control: PID controller (no trained model)\n")
-            except FileNotFoundError:
-                print("✗ No coordinator model found!")
-                print("  Train a model first: python -m src.train --timesteps 200000 --name experiment_v1")
-                return
-    except Exception as e:
-        print(f"✗ Error loading model: {e}")
-        return
+    # Load the trained coordinator model
+    if model_path:
+        # Use specified model path
+        model_path = Path(model_path)
+        if not model_path.exists():
+            print(f"\nError: Specified model not found: {model_path}")
+            return
+        print(f"\nLoading specified model: {model_path}")
+        coord_model = RecurrentPPO.load(model_path)
+    else:
+        # Try to load the latest experiment
+        model_dir = Path("models/action_coordinator")
+        latest_model = None
+        for exp_num in range(20, 0, -1):  # Try v20 down to v1
+            model_path = model_dir / f"experiment_v{exp_num}" / "best_model.zip"
+            if model_path.exists():
+                latest_model = model_path
+                print(f"\nLoading model: {model_path}")
+                break
+        
+        if latest_model is None:
+            print("\nNo trained model found!")
+            return
+        
+        coord_model = RecurrentPPO.load(latest_model)
     
-    # Create coordinator environment (no motor_model_path needed - uses PID)
+    # Create test environment with GUI and vision
     env = ActionCoordinatorEnv(
         gui=True,
-        enable_vision=True,  # Enable vision to match trained model
-        enable_streaming=True,  # Stream stereo vision to VLC
-        enable_obstacles=True,  # Show obstacles
-        num_obstacles=10
+        enable_vision=True,
+        enable_streaming=True,
+        num_obstacles=10,
+        enable_obstacles=True
     )
     
-    print("\n📹 Stereo vision streaming enabled!")
-    print("   Open in VLC: http://localhost:5555/stream")
-    print("   (Menu: Media → Open Network Stream → paste URL)\n")
+    print(f"Environment: {env.observation_space.shape[0]}D obs ({10 + (512 if env.enable_vision else 0)}D)")
+    print(f"Action space: Direct RPM commands [rpm0, rpm1, rpm2, rpm3]")
+    print(f"RPM range: Hover ± 5% ({int(env.HOVER_RPM * 0.95)} - {int(env.HOVER_RPM * 1.05)} RPM)")
+    print("="*80)
     
-    # Test scenarios - using same generation method as training
+    # Waypoint visualization markers
+    waypoint_markers = []
+    
+    def draw_waypoint_markers(waypoints, current_idx):
+        """Draw visual markers for waypoints in PyBullet GUI."""
+        nonlocal waypoint_markers
+        
+        # Remove old markers
+        for marker_id in waypoint_markers:
+            try:
+                p.removeBody(marker_id)
+            except:
+                pass
+        waypoint_markers.clear()
+        
+        # Draw new markers
+        for i, wp in enumerate(waypoints):
+            if i == current_idx:
+                # Current waypoint: Green sphere
+                color = [0, 1, 0, 0.8]  # Green, semi-transparent
+                radius = 0.3
+            elif i < current_idx:
+                # Reached waypoints: Gray sphere
+                color = [0.5, 0.5, 0.5, 0.3]  # Gray, very transparent
+                radius = 0.2
+            else:
+                # Future waypoints: Blue sphere
+                color = [0, 0.5, 1, 0.5]  # Blue, semi-transparent
+                radius = 0.25
+            
+            # Create visual shape
+            visual_shape = p.createVisualShape(
+                shapeType=p.GEOM_SPHERE,
+                radius=radius,
+                rgbaColor=color,
+                physicsClientId=env.CLIENT
+            )
+            
+            # Create marker body (no collision)
+            marker_id = p.createMultiBody(
+                baseMass=0,
+                baseVisualShapeIndex=visual_shape,
+                basePosition=wp,
+                physicsClientId=env.CLIENT
+            )
+            waypoint_markers.append(marker_id)
+    
+    # Run test scenarios
     test_scenarios = [
         {
             'name': 'Random Waypoints with Obstacles (Training-like)',
-            'waypoints': None,  # Will be generated by reset()
-            'duration': 1000,
-            'num_tests': 3  # Run 3 random scenarios
-        },
+            'num_runs': 3
+        }
     ]
     
-    print("="*80)
-    print("COORDINATOR AGENT TEST: Waypoint Navigation with Acceleration Commands")
-    print("="*80)
-    print(f"Environment: 526D obs (14D base + 512D vision)")
-    print(f"Action space: Acceleration commands [ax, ay, az, yaw_accel]")
-    print(f"Max accel: ±1.5 m/s² linear, ±π/4 rad/s² angular")
-    print("="*80)
-    
-    overall_results = []
-    
     for scenario in test_scenarios:
-        num_tests = scenario.get('num_tests', 1)
+        print(f"\n{'='*80}")
+        print(f"Scenario: {scenario['name']}")
+        print(f"{'='*80}\n")
         
-        for test_num in range(num_tests):
-            print(f"\n{'='*80}")
-            print(f"Scenario: {scenario['name']}")
-            if num_tests > 1:
-                print(f"Test run: {test_num + 1}/{num_tests}")
+        for run_idx in range(scenario['num_runs']):
+            print(f"{'='*80}")
+            print(f"Test run: {run_idx + 1}/{scenario['num_runs']}")
             print(f"{'='*80}")
             
-            # Reset environment (generates random waypoints and obstacles)
+            # Reset environment (generates random waypoints)
             obs, info = env.reset()
             
-            # Display generated waypoints
+            # Draw waypoint markers
+            draw_waypoint_markers(env.waypoints, env.current_waypoint_idx)
+            
+            # Print waypoints
             print(f"Waypoints: {len(env.waypoints)}")
             for i, wp in enumerate(env.waypoints):
                 print(f"  WP{i}: [{wp[0]:+.1f}, {wp[1]:+.1f}, {wp[2]:+.1f}]")
-            print(f"{'='*80}")
+            print(f"{'='*80}\n")
             
-            # Initialize LSTM state for RecurrentPPO models
-            # For RecurrentPPO, we need to track episode_start and lstm_states
+            # Initialize LSTM states
             lstm_states = None
             episode_start = np.ones((1,), dtype=bool)
             
-            waypoints_reached = 0
-            total_distance_to_waypoints = 0
-            position_history = []
-            velocity_commands = []
             step_count = 0
-            terminated = False  # Initialize to avoid unbound variable
-            truncated = False
+            total_reward = 0
+            waypoints_reached = 0
             
-            for step in range(scenario['duration']):
-                # Get current state
-                state = env._getDroneStateVector(0)
-                pos = state[:3]
-                vel = state[10:13]
-                position_history.append(pos.copy())
-                
-                # Update camera to follow drone
-                camera_distance = 1.0
-                camera_yaw = 45
-                camera_pitch = -30
-                p.resetDebugVisualizerCamera(
-                    cameraDistance=camera_distance,
-                    cameraYaw=camera_yaw,
-                    cameraPitch=camera_pitch,
-                    cameraTargetPosition=pos.tolist()
+            while step_count < 1000:  # Max 1000 steps per test
+                # Get action from coordinator model
+                action, lstm_states = coord_model.predict(
+                    obs,
+                    state=lstm_states,
+                    episode_start=episode_start,
+                    deterministic=True
                 )
+                episode_start = np.zeros((1,), dtype=bool)
                 
-                # Get velocity command from coordinator
-                # RecurrentPPO needs episode_start and lstm_states
-                is_recurrent = HAS_RECURRENT and hasattr(coord_model, 'policy') and hasattr(coord_model.policy, 'lstm_actor')
-                if is_recurrent:
-                    action, lstm_states = coord_model.predict(
-                        obs, 
-                        state=lstm_states,
-                        episode_start=episode_start,
-                        deterministic=True
-                    )
-                    episode_start = np.zeros((1,), dtype=bool)  # Only True on first step
-                else:
-                    action, _ = coord_model.predict(obs, deterministic=True)
-                velocity_commands.append(action.copy())
-                
-                # Execute action (coordinator commands motor controller internally)
+                # Execute action
                 obs, reward, terminated, truncated, info = env.step(action)
+                
+                # Update waypoint markers if waypoint changed
+                if info.get('waypoint_reached', False):
+                    draw_waypoint_markers(env.waypoints, env.current_waypoint_idx)
+                    waypoints_reached += 1
+                
+                total_reward += reward
                 step_count += 1
                 
-                # Track waypoints reached
-                current_wp = env.waypoints[env.current_waypoint_idx]
-                dist_to_wp = np.linalg.norm(pos - current_wp)
-                total_distance_to_waypoints += dist_to_wp
-                
-                if env.waypoints_reached > waypoints_reached:
-                    waypoints_reached = env.waypoints_reached
-                    print(f"  ✓ Waypoint {waypoints_reached} reached at step {step}")
-                
                 # Print progress
-                if step % 50 == 0:
-                    print(f"  Step {step:3d}: "
-                          f"pos=[{pos[0]:+.2f}, {pos[1]:+.2f}, {pos[2]:+.2f}], "
-                          f"vel_cmd=[{action[0]:+.2f}, {action[1]:+.2f}, {action[2]:+.2f}], "
-                          f"dist_to_wp={dist_to_wp:.2f}m, "
-                          f"reward={reward:+.2f}")
+                pos = env._getDroneStateVector(0)[0:3]
+                current_wp = env.waypoints[env.current_waypoint_idx]
+                dist = np.linalg.norm(pos - current_wp)
                 
-                time.sleep(0.02)  # Slow down for visualization
+                # Update camera to follow drone
+                p.resetDebugVisualizerCamera(
+                    cameraDistance=1.0,
+                    cameraYaw=50,
+                    cameraPitch=-35,
+                    cameraTargetPosition=pos,
+                    physicsClientId=env.CLIENT
+                )
                 
-                if terminated:
-                    print(f"\n  Episode terminated at step {step}")
-                    print(f"  Reason: Crashed or out of bounds")
+                #disabled detailed step printout to reduce console spam
+                # print(f"Step {step_count:4d} | "
+                #       f"Pos: [{pos[0]:+5.2f}, {pos[1]:+5.2f}, {pos[2]:+5.2f}] | "
+                #       f"WP{env.current_waypoint_idx}: [{current_wp[0]:+5.2f}, {current_wp[1]:+5.2f}, {current_wp[2]:+5.2f}] | "
+                #       f"Dist: {dist:5.2f}m | "
+                #       f"Reward: {reward:+7.2f} | "
+                #       f"Total: {total_reward:+8.2f}")
+                
+                if terminated or truncated:
                     break
                 
-                if truncated:
-                    print(f"\n  Episode truncated at step {step}")
-                    break
+                time.sleep(0.1)  # Slow down for visualization
             
-            # Calculate statistics
-            completion_rate = waypoints_reached / len(env.waypoints) * 100
-            avg_dist_to_wp = total_distance_to_waypoints / step_count if step_count > 0 else 0
+            # Print summary
+            print(f"\n{'='*80}")
+            print(f"Test Run {run_idx + 1} Summary:")
+            print(f"  Steps: {step_count}")
+            print(f"  Total Reward: {total_reward:.2f}")
+            print(f"  Waypoints Reached: {waypoints_reached}/{len(env.waypoints)}")
+            print(f"  Terminated: {terminated}")
+            print(f"  Truncated: {truncated}")
+            if 'crashed' in info:
+                print(f"  Crashed: {info['crashed']}")
+            print(f"{'='*80}\n")
             
-            # Calculate path smoothness (acceleration changes)
-            velocity_commands = np.array(velocity_commands)
-            if len(velocity_commands) > 1:
-                vel_changes = np.diff(velocity_commands, axis=0)
-                avg_vel_change = np.mean(np.linalg.norm(vel_changes, axis=1))
-            else:
-                avg_vel_change = 0
-            
-            # Calculate total distance traveled
-            position_history = np.array(position_history)
-            if len(position_history) > 1:
-                distances = np.linalg.norm(np.diff(position_history, axis=0), axis=1)
-                total_distance = np.sum(distances)
-            else:
-                total_distance = 0
-            
-            final_pos = position_history[-1] if len(position_history) > 0 else np.zeros(3)
-            
-            print(f"\n  --- Results ---")
-            print(f"  Waypoints reached: {waypoints_reached}/{len(env.waypoints)} ({completion_rate:.1f}%)")
-            print(f"  Steps completed: {step_count}/{scenario['duration']}")
-            print(f"  Average distance to waypoint: {avg_dist_to_wp:.2f}m")
-            print(f"  Total distance traveled: {total_distance:.2f}m")
-            print(f"  Average velocity change: {avg_vel_change:.3f} m/s/step")
-            print(f"  Final position: [{final_pos[0]:+.2f}, {final_pos[1]:+.2f}, {final_pos[2]:+.2f}]")
-            print(f"  Crashed: {'YES' if terminated else 'NO'}")
-            
-            # Evaluate performance
-            if completion_rate >= 80 and not terminated:
-                status = "✅ EXCELLENT"
-            elif completion_rate >= 50 and not terminated:
-                status = "✓ GOOD"
-            elif completion_rate >= 30:
-                status = "⚠ FAIR"
-            else:
-                status = "✗ POOR"
-            print(f"  Performance: {status}")
-            
-            test_name = f"{scenario['name']}"
-            if num_tests > 1:
-                test_name += f" (Run {test_num + 1})"
-            
-            overall_results.append({
-                'name': test_name,
-                'completion': completion_rate,
-                'crashed': terminated,
-                'avg_dist': avg_dist_to_wp
-            })
-            
-            time.sleep(2.0)  # Pause between scenarios
+            time.sleep(2.0)  # Pause between runs
     
+    # Cleanup
     env.close()
-    
-    # Overall summary
-    print(f"\n{'='*80}")
-    print("OVERALL COORDINATOR PERFORMANCE")
-    print(f"{'='*80}")
-    
-    avg_completion = np.mean([r['completion'] for r in overall_results])
-    crash_count = sum([1 for r in overall_results if r['crashed']])
-    
-    print(f"Average waypoint completion: {avg_completion:.1f}%")
-    print(f"Scenarios crashed: {crash_count}/{len(overall_results)}")
-    
-    for result in overall_results:
-        crash_marker = "💥" if result['crashed'] else "✓"
-        print(f"  {crash_marker} {result['name']:20s}: {result['completion']:5.1f}% complete, "
-              f"avg dist {result['avg_dist']:.2f}m")
-    
-    if avg_completion >= 70 and crash_count == 0:
-        print("\n✅ EXCELLENT: Coordinator navigates waypoints successfully!")
-    elif avg_completion >= 50 and crash_count <= 1:
-        print("\n✓ GOOD: Coordinator shows solid navigation performance")
-    elif avg_completion >= 30:
-        print("\n⚠ FAIR: Coordinator needs improvement")
-    else:
-        print("\n✗ POOR: Coordinator struggles with waypoint navigation")
-    print(f"{'='*80}\n")
 
 if __name__ == "__main__":
-    test_hierarchical_system()
+    parser = argparse.ArgumentParser(description="Test hierarchical system with trained models")
+    parser.add_argument("--model", type=str, default=None, 
+                        help="Path to specific model file (e.g., models/action_coordinator/experiment_v13/best_model.zip)")
+    args = parser.parse_args()
+    
+    test_hierarchical_system(model_path=args.model)

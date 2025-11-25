@@ -344,12 +344,13 @@ class ObstacleGenerator:
             except Exception as e:
                 print(f"Warning: Failed to create obstacle {i+1}: {e}")
         
-        print(f"[ObstacleGenerator] Created {len(new_obstacle_ids)}/{num_obstacles} obstacles")
+        # Suppress output during training (interferes with progress bars)
+        # print(f"[ObstacleGenerator] Created {len(new_obstacle_ids)}/{num_obstacles} obstacles")
         
-        if self.voxel_grid is not None:
-            stats = self.voxel_grid.get_occupancy_stats()
-            print(f"[ObstacleGenerator] Voxel occupancy: {stats['occupied_voxels']}/{stats['total_voxels']} "
-                  f"({stats['occupancy_ratio']*100:.1f}%)")
+        # if self.voxel_grid is not None:
+        #     stats = self.voxel_grid.get_occupancy_stats()
+        #     print(f"[ObstacleGenerator] Voxel occupancy: {stats['occupied_voxels']}/{stats['total_voxels']} "
+        #           f"({stats['occupancy_ratio']*100:.1f}%)")
         
         return new_obstacle_ids
     
