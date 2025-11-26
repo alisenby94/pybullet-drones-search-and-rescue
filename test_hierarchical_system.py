@@ -149,6 +149,8 @@ def test_hierarchical_system(model_path=None):
             step_count = 0
             total_reward = 0
             waypoints_reached = 0
+            terminated = False
+            truncated = False
             
             while step_count < 1000:  # Max 1000 steps per test
                 # Get action from coordinator model
@@ -185,18 +187,33 @@ def test_hierarchical_system(model_path=None):
                     physicsClientId=env.CLIENT
                 )
                 
-                #disabled detailed step printout to reduce console spam
-                # print(f"Step {step_count:4d} | "
-                #       f"Pos: [{pos[0]:+5.2f}, {pos[1]:+5.2f}, {pos[2]:+5.2f}] | "
-                #       f"WP{env.current_waypoint_idx}: [{current_wp[0]:+5.2f}, {current_wp[1]:+5.2f}, {current_wp[2]:+5.2f}] | "
-                #       f"Dist: {dist:5.2f}m | "
-                #       f"Reward: {reward:+7.2f} | "
-                #       f"Total: {total_reward:+8.2f}")
+                # Print status bar at bottom (overwrites itself)
+                # Get observation components
+                obs_base = obs[:10]  # First 10 elements are base obs
+                vel = obs_base[0:3]
+                ang_vel = obs_base[3:6]
+                vec_to_wp = obs_base[6:9]
+                
+                # Format status bar
+                status = (
+                    f"\r[Step {step_count:4d}] "
+                    f"Pos:[{pos[0]:+5.2f},{pos[1]:+5.2f},{pos[2]:+5.2f}] "
+                    f"Vel:[{vel[0]:+5.2f},{vel[1]:+5.2f},{vel[2]:+5.2f}] "
+                    f"AngVel:[{ang_vel[0]:+5.2f},{ang_vel[1]:+5.2f},{ang_vel[2]:+5.2f}] "
+                    f"ToWP:[{vec_to_wp[0]:+5.2f},{vec_to_wp[1]:+5.2f},{vec_to_wp[2]:+5.2f}] "
+                    f"Dist:{dist:5.2f}m "
+                    f"Reward:{reward:+7.2f} "
+                    f"Total:{total_reward:+8.2f}"
+                )
+                print(status, end='', flush=True)
                 
                 if terminated or truncated:
                     break
                 
                 time.sleep(0.1)  # Slow down for visualization
+            
+            # Print newline after status bar before summary
+            print()  # Move to next line
             
             # Print summary
             print(f"\n{'='*80}")

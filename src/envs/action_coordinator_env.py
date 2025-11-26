@@ -234,123 +234,137 @@ class ActionCoordinatorEnv(BaseRLAviary):
         vel = state[10:13]
         
         # Start with survival bonus (staying alive has value)
-        reward = 1.0
+        reward = 5.0
+        
+        # CRITICAL: Global altitude safety - prevent ground crashes
+        # Only penalize dangerously low altitude (below 0.5m)
+        # Target altitude shaping is handled separately below
+        min_safe_altitude = 0.2  # Absolute crash threshold
+        danger_zone_start = 0.8  # Start warning below this altitude
+        
+        if pos[2] < danger_zone_start:
+            # Exponential penalty that grows as we approach ground
+            # z=0.8m → 0, z=0.5m → -5, z=0.3m → -20, z=0.2m → -50
+            height_above_crash = max(0.01, pos[2] - min_safe_altitude)
+            reward_global_altitude = -50.0 * np.exp(-height_above_crash / 0.2)
+            reward_global_altitude = np.clip(reward_global_altitude, -50.0, 0.0)
+        else:
+            reward_global_altitude = 0.0
+        
+        reward += reward_global_altitude
         
         # Progress reward: Encourage moving toward waypoint
         current_wp = self.waypoints[self.current_waypoint_idx]
         dist = np.linalg.norm(pos - current_wp)
         prev_dist = np.linalg.norm(self.previous_pos - current_wp)
         progress = prev_dist - dist
-        reward_progress = 10.0 * progress  # Reward getting closer
+        reward_progress = 25.0 * progress  # REDUCED from 10.0 - more subtle shaping
         reward += reward_progress
         
         if dist < self.waypoint_radius:
-            reward += 200.0  # SUCCESS! Found waypoint (increased to dominate crash penalty)
+            reward += 400.0  # INCREASED from 200.0 - make success very attractive
         
-        # Roll/Pitch stability: Encourage level, forward-facing flight
-        # This replaces velocity-based heading alignment with absolute attitude rewards
-        # Decouples attitude control from instantaneous velocity direction
+        # Roll/Pitch stability: Encourage level flight (but don't punish too hard)
+        # REDUCED penalties - allow exploration without flipping out
         roll = state[7]   # Roll angle (rotation about X-axis)
         pitch = state[8]  # Pitch angle (rotation about Y-axis, positive = nose down)
         
-        # Roll stability: sech(4*roll) - 1
-        # CRITICAL: Must learn stable flight before navigation
-        # roll=0°: 0, roll=±15°: -0.43, roll=±30°: -0.86, roll=±45°: -0.96
-        roll_weight = 2.0  # Increased from 1.0 - stability is CRITICAL
+        # Roll stability: Gentle penalty for tilting
+        # roll=0°: 0, roll=±15°: -0.21, roll=±30°: -0.43, roll=±45°: -0.48
+        roll_weight = 2.0  # REDUCED from 2.0 - less harsh
         reward_roll = (1.0 / np.cosh(4.0 * roll) - 1.0) * roll_weight
         reward += reward_roll
         
-        # Pitch stability: (tanh(12*pitch*π + 5) - 3) / 2 + sech(2*pitch)
-        # CRITICAL: Asymmetric penalty - heavily punishes backward tilt
-        # Allows/encourages slight forward tilt for forward flight
-        pitch_weight = 2.0  # Increased from 1.0 - stability is CRITICAL
+        # Pitch stability: Allow forward tilt, discourage backward tilt
+        # REDUCED weight - don't punish exploration
+        pitch_weight = 2.0  # REDUCED from 2.0 - less harsh
         reward_pitch = ((np.tanh(12.0 * pitch * np.pi + 5) - 3.0) / 2.0 + 
                         1.0 / np.cosh(2.0 * pitch)) * pitch_weight
         reward += reward_pitch
         
-        # Distance-scaled altitude penalty: Altitude matters MORE as we approach target
-        # Far away: altitude doesn't matter much (freedom to explore vertical space)
-        # Close: altitude is critical (precision landing/hovering)
+        # Target altitude shaping: Guide drone toward waypoint's altitude
+        # This is SEPARATE from crash prevention - shapes toward target height
         target_altitude = current_wp[2]
         altitude_error = abs(pos[2] - target_altitude)
         
-        # Scale altitude importance with proximity: starts mattering around 3-4m
-        # dist>5m → 0.15, dist=3m → 0.5, dist=2m → 0.75, dist=1m → 0.95, dist=0.5m → 1.0
-        altitude_scale = 1.0 * np.exp(-dist / 2.5)  # FIXED: Now increases as we get closer
-        altitude_weight = 1.5  # Base weight (total max ~1.5 for 1m error at close range)
-        reward_altitude = -altitude_weight * altitude_scale * altitude_error
+        # ALWAYS encourage matching target altitude (not distance-scaled)
+        # Being at wrong altitude makes navigation harder
+        # z_error=0m → 0, z_error=0.5m → -1.25, z_error=1.0m → -2.5, z_error=2.0m → -5.0
+        altitude_weight = 2.5  # INCREASED - altitude matching is important for navigation
+        reward_altitude = -altitude_weight * altitude_error
         reward += reward_altitude
         
-        # Forward velocity reward: Encourage moving forward when far, hovering when close
-        # Get drone's forward direction from yaw angle
-        yaw = state[9]  # Yaw angle (rotation about Z-axis)
-        forward_direction = np.array([np.cos(yaw), np.sin(yaw), 0.0])
+        # SIMPLIFIED VELOCITY REWARDS
+        # 1. Reward forward motion (body frame - for stereo vision)
+        # 2. Reward moving toward waypoint (prioritize Z over XY)
         
-        # Project velocity onto forward direction
-        vel_forward = np.dot(vel, forward_direction)
+        # Forward motion reward (body frame)
+        # Stereo camera is on front of drone, so encourage forward flight
+        rpy = state[7:10]
+        yaw = rpy[2]
         
-        # Distance-aware velocity reward: only reward speed when far from target
-        # When close, reward approaches zero (hovering is better than speed)
+        # Body-frame forward direction (positive X in body frame)
+        forward_dir = np.array([np.cos(yaw), np.sin(yaw), 0.0])
+        vel_forward = np.dot(vel, forward_dir)
+        
         forward_weight = 1.0
-        safe_forward_vel = 2.0  # m/s - reasonable cruise speed
-        
-        # Distance modulation: far = full reward, close = zero reward
-        # Use smooth transition with tanh: dist>3m → 1.0, dist<1m → ~0.0
-        distance_factor = np.tanh(dist / 2.0)  # dist=0→0, dist=2→0.76, dist=4→0.96
-        
-        if vel_forward > 0:
-            # Saturating reward: tanh gives smooth plateau at safe speed
-            # vel=0→0, vel=1→0.76, vel=2→0.96, vel=3→0.995 (plateau)
-            normalized_vel = vel_forward / safe_forward_vel
-            reward_forward = forward_weight * safe_forward_vel * np.tanh(normalized_vel) * distance_factor
-        else:
-            # Penalize backward motion linearly (also modulated by distance)
-            reward_forward = forward_weight * vel_forward * distance_factor
-        
+        reward_forward = forward_weight * vel_forward  # Reward forward speed
         reward += reward_forward
         
-        # Velocity alignment reward: MASSIVELY reward moving directly toward target
-        # Start rewarding good trajectories early (3-4m out), amplify as we get closer
-        # Philosophy: Speed is OK if you're aimed correctly, dangerous if you're not
+        # Target alignment reward (constant weight)
+        # Decompose velocity toward waypoint into horizontal and vertical components
         direction_to_wp = (current_wp - pos) / (dist + 1e-6)
-        speed = np.linalg.norm(vel)
         
-        # Velocity alignment: dot product of velocity unit vector with direction to target
-        # Returns: -1 (moving away), 0 (perpendicular), +1 (perfect alignment)
-        if speed > 0.1:  # Only compute alignment if moving
-            vel_unit = vel / speed
-            alignment = np.dot(vel_unit, direction_to_wp)
+        # Horizontal (XY) alignment
+        direction_to_wp_xy = direction_to_wp[:2]
+        direction_to_wp_xy_norm = np.linalg.norm(direction_to_wp_xy)
+        if direction_to_wp_xy_norm > 0.01:
+            direction_to_wp_xy = direction_to_wp_xy / direction_to_wp_xy_norm
+            vel_toward_wp_xy = np.dot(vel[:2], direction_to_wp_xy)
         else:
-            alignment = 0.0  # Hovering = neutral
+            vel_toward_wp_xy = 0.0
         
-        # Distance-scaled alignment reward: wider range, starts mattering at 4-5m
-        # Scaling factor should grow but stay comparable to other rewards
-        # dist>5m → 0.5, dist=3m → 1.0, dist=2m → 1.5, dist=1m → 2.2, dist=0.5m → 2.7
-        # Uses exponential decay instead of tanh for smoother, wider influence
-        alignment_scale = 0.5 + 2.5 * np.exp(-dist / 3.0)  # Modest baseline, grows as we approach
-        alignment_weight = 1.5  # Base weight (total max ~4.0-6.0 at close range)
+        # Vertical (Z) alignment
+        vel_toward_wp_z = vel[2] * np.sign(direction_to_wp[2])  # Positive when moving in correct Z direction
         
-        # Reward perfect alignment, penalize misalignment
-        # alignment=+1.0, close → ~4-6, alignment=0.0 → 0, alignment=-1.0 → -4 to -6
-        reward_vel_align = alignment_weight * alignment_scale * alignment
+        # Reward with Z weighted more heavily than XY
+        xy_alignment_weight = 0.3  # Small reward for horizontal alignment
+        z_alignment_weight = 1.0   # Larger reward for vertical alignment
+        
+        reward_vel_align = (xy_alignment_weight * vel_toward_wp_xy + 
+                           z_alignment_weight * vel_toward_wp_z)
         reward += reward_vel_align
         
-        # Velocity magnitude penalty when close BUT ONLY if misaligned
-        # Well-aimed high speed: minimal penalty
-        # Poorly-aimed high speed: moderate penalty (prevent wild overshooting)
-        # Wider effective range: starts mattering at 3-4m out
-        # dist>5m → 0.15, dist=3m → 0.5, dist=2m → 0.75, dist=1m → 0.95, dist=0.5m → 1.0
-        proximity_factor = np.exp(-dist / 2.5)  # FIXED: Now increases as we get closer
+        # Store for metrics
+        speed = np.linalg.norm(vel)
+        alignment = np.dot(vel, direction_to_wp) / (speed + 1e-6) if speed > 0.1 else 0.0
         
-        # Misalignment factor: alignment=+1.0 → 0.0 (no penalty), alignment=0.0 → 0.5, alignment=-1.0 → 1.0 (max penalty)
-        misalignment_factor = (1.0 - alignment) / 2.0
+        # Speed reward: Encourage flying at reasonable speed (not too slow, not too fast)
+        # Constant reward when speed is below max travel speed
+        max_travel_speed = 1.0  # m/s - reasonable cruising speed
+        speed_weight = 1.0
         
-        # Combined speed penalty: only applies when close AND misaligned
-        # Aimed correctly + close + fast → minimal penalty
-        # Aimed wrong + close + fast → moderate penalty (max ~1.5 at full speed)
-        speed_penalty_weight = 1.0  # Reduced to match other reward magnitudes
-        reward_speed_limit = -speed_penalty_weight * proximity_factor * misalignment_factor * (speed**2 / safe_forward_vel**2)
+        if speed < max_travel_speed:
+            # Reward for controlled flight at safe speed
+            reward_speed_limit = speed_weight * 1.0
+        else:
+            # Penalty for excessive speed (dangerous, hard to control)
+            overspeed_factor = (speed - max_travel_speed) / max_travel_speed
+            reward_speed_limit = -speed_weight * overspeed_factor
+        
         reward += reward_speed_limit
+        
+        # RPM symmetry penalty: Encourage balanced rotor speeds
+        # Penalize deviation from the MEAN rotor speed (not hover)
+        # This encourages symmetric control while allowing altitude changes
+        # Example: [0.5, 0.5, 0.5, 0.5] → penalty ≈ 0 (all same, good!)
+        # Example: [1.0, 1.0, 1.0, 1.0] → penalty ≈ 0 (all same, climbing uniformly)
+        # Example: [1.0, 0.0, 1.0, 0.0] → penalty ≈ -0.05 (asymmetric, discouraged)
+        mean_action = np.mean(self._current_action)
+        action_variance = np.sum((self._current_action - mean_action)**2)
+        rpm_symmetry_weight = 0.05  # Gentle encouragement for symmetric control
+        reward_rpm_deviation = -rpm_symmetry_weight * action_variance
+        reward += reward_rpm_deviation
         
         # Hover reward: ONLY on the final waypoint (encourages continuous motion through checkpoints)
         # First waypoints: pass through quickly (no hover reward)
@@ -377,19 +391,25 @@ class ActionCoordinatorEnv(BaseRLAviary):
         altitude = pos[2]
         
         # Store components for metrics
+        vel_toward_wp = vel_toward_wp_xy + vel_toward_wp_z  # Combined for logging
+        vel_lateral = vel - vel_toward_wp * direction_to_wp
+        vel_lateral_mag = np.linalg.norm(vel_lateral)
+        accel = (vel - self.previous_vel) / (1.0 / self.control_freq)
+        accel_magnitude = np.linalg.norm(accel)
+        
         self._progress = progress
         self._reward_progress = reward_progress
         self._vel_toward_wp = vel_toward_wp
         self._vel_lateral_mag = vel_lateral_mag
         self._accel_magnitude = accel_magnitude
-        self._vel_forward = vel_forward
-        self._reward_forward = reward_forward
+        self._vel_forward = vel_forward  # Body-frame forward velocity
+        self._reward_forward = reward_forward  # Body-frame forward reward
         self._reward_hover = reward_hover
-        self._distance_factor = distance_factor
+        self._distance_factor = 0.0  # Removed distance scaling
         self._alignment = alignment
-        self._alignment_scale = alignment_scale
+        self._alignment_scale = 1.0  # Constant now
         self._reward_vel_align = reward_vel_align
-        self._misalignment_factor = misalignment_factor
+        self._misalignment_factor = 0.0  # Removed
         self._reward_lateral = 0.0
         self._reward_accel = 0.0
         self._roll = roll
@@ -398,10 +418,11 @@ class ActionCoordinatorEnv(BaseRLAviary):
         self._reward_pitch = reward_pitch
         self._altitude = altitude
         self._altitude_error = altitude_error
-        self._altitude_scale = altitude_scale
         self._reward_altitude = reward_altitude
         self._speed = speed
-        self._reward_speed_limit = reward_speed_limit
+        self._reward_speed_limit = 0.0  # Removed speed limit penalty
+        self._reward_global_altitude = reward_global_altitude
+        self._reward_rpm_deviation = reward_rpm_deviation
         
         # Obstacle proximity penalty (if voxel grid available)
         reward_obstacle = 0.0
@@ -460,14 +481,30 @@ class ActionCoordinatorEnv(BaseRLAviary):
         self.previous_pos = pos.copy()
         self.previous_vel = vel.copy()
         
+        # Final safety clamp: prevent catastrophic reward explosions
+        # Normal operation: reward in [-50, +350] range
+        # Allow some flexibility but prevent numerical disasters
+        reward = np.clip(reward, -100.0, 500.0)
+        
         return reward
     
     def _computeTerminated(self):
         """Check if episode should terminate (crash or all waypoints reached)."""
-        pos = self._getDroneStateVector(0)[0:3]
+        state = self._getDroneStateVector(0)
+        pos = state[0:3]
+        roll = state[7]
+        pitch = state[8]
         
-        # Ground crash only (removed ceiling and horizontal bounds for testing)
+        # Ground crash
         if pos[2] < 0.1:
+            self._crash_type = 'ground'
+            return True
+        
+        # Upside-down crash: Terminate if drone flips over
+        # Prevents "hucking" strategy where drone flips to throw itself at target
+        # Real quadcopters can't fly inverted (without special hardware)
+        if abs(roll) > np.pi/2 or abs(pitch) > np.pi/2:
+            self._crash_type = 'inverted'
             return True
         
         # Obstacle collision - use PyBullet contact detection directly
@@ -479,8 +516,11 @@ class ActionCoordinatorEnv(BaseRLAviary):
                 # contact[2] is bodyB ID
                 # Ground plane typically has ID 0, obstacles have higher IDs
                 if contact[2] > 0:  # Not ground plane
+                    self._crash_type = 'obstacle'
                     return True
         
+        # No crash detected
+        self._crash_type = None
         return False
     
     def _computeTruncated(self):
@@ -517,7 +557,6 @@ class ActionCoordinatorEnv(BaseRLAviary):
             'min_obstacle_dist': getattr(self, '_min_obstacle_dist', float('inf')),
             'reward_obstacle': getattr(self, '_reward_obstacle', 0.0),
             'reward_altitude': getattr(self, '_reward_altitude', 0.0),
-            'altitude_scale': getattr(self, '_altitude_scale', 0.0),
             'altitude_error': getattr(self, '_altitude_error', 0.0),
             'speed': getattr(self, '_speed', 0.0),
             'reward_speed_limit': getattr(self, '_reward_speed_limit', 0.0),
@@ -525,13 +564,15 @@ class ActionCoordinatorEnv(BaseRLAviary):
             'reward_smoothness': getattr(self, '_reward_smoothness', 0.0),
             'reward_hover': getattr(self, '_reward_hover', 0.0),
             'distance_factor': getattr(self, '_distance_factor', 0.0),
+            'reward_global_altitude': getattr(self, '_reward_global_altitude', 0.0),
+            'reward_rpm_deviation': getattr(self, '_reward_rpm_deviation', 0.0),
         }
     
     def _preprocessAction(self, action):
         """
         Convert normalized action to RPM commands.
         
-        Simple direct mapping: action ∈ [-1, 1] → RPM = HOVER_RPM * (1 + action * 0.05)
+        Simple direct mapping: action ∈ [-1, 1] → RPM = HOVER_RPM * (1 + action * 0.06)
         Also tracks action for smoothness penalty.
         
         Args:
@@ -564,6 +605,7 @@ class ActionCoordinatorEnv(BaseRLAviary):
         self.previous_vel = np.zeros(3)
         self.previous_action = np.zeros(4)
         self.compliance = 1.0
+        self._crash_type = None
         
         # Initialize empty waypoints so _computeObs() doesn't crash
         self.waypoints = [np.array([0.0, 0.0, 1.75]) for _ in range(5)]
@@ -711,29 +753,30 @@ class ActionCoordinatorEnv(BaseRLAviary):
         info['perturbation_magnitude'] = perturbation_magnitude
         info['curriculum_timesteps'] = self.curriculum_timesteps
         
-        # Crash penalty: Moderate - must enable long exploration episodes
-        # Waypoint reward (200) should dominate to ensure positive learning signal
-        # Even with 2:1 crash-to-success ratio, net reward is positive
+        # Crash penalty: Apply appropriate penalty based on crash type
+        # Waypoint reward (+300) should dominate to ensure positive learning signal
         if terminated:
-            crash_penalty = -50.0  # Reduced to allow positive net learning
+            # Different penalties for different crash types
+            crash_type = getattr(self, '_crash_type', 'ground')
             
-            # Additional penalty for obstacle collision
-            pos = self._getDroneStateVector(0)[0:3]
-            if self.enable_obstacles and self.voxel_grid is not None:
-                if self.voxel_grid.is_occupied(pos):
-                    crash_penalty = -75.0  # Extra penalty for obstacle crashes
-                    info['obstacle_crash'] = True
-                else:
-                    info['obstacle_crash'] = False
-            else:
-                info['obstacle_crash'] = False
+            if crash_type == 'inverted':
+                crash_penalty = -100.0  # Harsh penalty for flipping over (degenerate strategy)
+                info['crash_type'] = 'inverted'
+            elif crash_type == 'obstacle':
+                crash_penalty = -75.0  # Extra penalty for obstacle crashes
+                info['crash_type'] = 'obstacle'
+            else:  # 'ground' or unknown
+                crash_penalty = -50.0  # Standard ground crash penalty
+                info['crash_type'] = 'ground'
             
             reward += crash_penalty
             info['crashed'] = True
             info['crash_penalty'] = crash_penalty
+            info['obstacle_crash'] = (crash_type == 'obstacle')
         else:
             info['crashed'] = False
             info['obstacle_crash'] = False
             info['crash_penalty'] = 0.0
+            info['crash_type'] = 'none'
         
         return obs, reward, terminated, truncated, info
