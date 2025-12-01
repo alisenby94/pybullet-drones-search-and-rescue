@@ -2,7 +2,7 @@
 Action Coordinator Environment (Stage 1)
 
 PURPOSE:
-    Learn high-level navigation by directly commanding motor RPMs.
+    Learn high-level navigation using velocity + heading commands.
     
 INPUTS:
     - Current velocity (3D)
@@ -12,8 +12,8 @@ INPUTS:
     - Stereovision depth map (512D) - optional
     
 OUTPUTS:
-    - Normalized RPM commands [-1, 1]^4
-    - Centered at hover RPM (16000) ±5% variation
+    - Velocity commands [vx, vy, vz] in range [-1, 1] (scaled to ±1.0 m/s)
+    - Target heading [yaw] in range [-1, 1] (scaled to ±π rad = ±180°)
     
 REWARD:
     - Progress toward waypoint
@@ -28,17 +28,22 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../../simulation/gym
 
 import numpy as np
 from gymnasium import spaces
-from gym_pybullet_drones.envs.BaseRLAviary import BaseRLAviary
+from gym_pybullet_drones.envs.VelocityAviary import VelocityAviary
 from gym_pybullet_drones.utils.enums import DroneModel, Physics, ActionType, ObservationType
 from gym_pybullet_drones.control.DSLPIDControl import DSLPIDControl
 
 
-class ActionCoordinatorEnv(BaseRLAviary):
+class ActionCoordinatorEnv(VelocityAviary):
     """
     Stage 1: High-level action coordinator environment.
     
-    Directly commands motor RPMs to navigate through waypoints.
-    Simple, deterministic physics with no hidden control layers.
+    Extends the library's VelocityAviary to add:
+    - Yaw control (4th action component)
+    - Waypoint navigation rewards
+    - Optional obstacle avoidance
+    - Optional stereovision
+    
+    Uses library's PID controller for low-level control (exact same as working test files).
     """
     
     def __init__(self, gui=False, enable_vision=False, enable_streaming=False, 
@@ -48,18 +53,22 @@ class ActionCoordinatorEnv(BaseRLAviary):
         
         Args:
             gui: Enable PyBullet GUI
-            enable_vision: Enable stereovision system (adds 2048D to observation)
+            enable_vision: Enable stereovision system (adds 512D to observation)
             enable_streaming: Enable video streaming to VLC (requires enable_vision=True)
             num_obstacles: Number of random obstacles to generate
             enable_obstacles: Enable obstacle generation
         """
-        self.control_freq = 10  # Action coordinator runs at 10 Hz
+        self.control_freq = 48  # Action coordinator runs at 48 Hz (PID frequency)
+        # Note: Originally intended 10 Hz but super().step() runs one PID cycle
+        # 48 Hz gives agent more control authority which helps learning!
         self.max_episode_steps = 500
         self.current_step = 0
         
-        # RPM control constants
-        self.HOVER_RPM = 16000  # Nominal hover RPM for CF2X
-        self.RPM_VARIATION = 0.10  # ±10% variation around hover
+        # Velocity + Heading control constants
+        # CRITICAL: This MUST match what we set in super().__init__() later!
+        # VelocityAviary sets SPEED_LIMIT = 0.03 * MAX_SPEED_KMH * (1000/3600) ≈ 0.25 m/s
+        # We override it to 2.0 m/s after super().__init__()
+        self.MAX_VELOCITY = 2.0  # m/s - maximum velocity in any direction
         
         # Waypoints
         self.waypoints = []
@@ -77,6 +86,10 @@ class ActionCoordinatorEnv(BaseRLAviary):
         self.previous_vel = np.zeros(3)
         self.previous_action = np.zeros(4)  # For smoothness penalty
         self.compliance = 1.0  # Tracking quality (placeholder, not used in RPM mode)
+        
+        # Velocity tracking metrics
+        self.target_velocity = np.zeros(3)  # Commanded velocity to PID
+        self.velocity_tracking_error = 0.0  # |target_vel - actual_vel|
         
         # Obstacle configuration
         self.enable_obstacles = enable_obstacles
@@ -101,25 +114,24 @@ class ActionCoordinatorEnv(BaseRLAviary):
             if enable_streaming:
                 print(f"[ActionCoordinator] Video streaming enabled - open in VLC: http://localhost:5555/stream")
         
-        # Motor control uses PID controller (no trained model needed)
-        # The DSL PID controller is initialized after super().__init__()
+        # VelocityYawAviary handles velocity + yaw control with internal PID
+        # Action coordinator runs at 10 Hz, VelocityYawAviary at 48 Hz
         
         super().__init__(
-            drone_model=DroneModel.CF2X,
+            gui=gui,
             num_drones=1,
             initial_xyzs=np.array([[0, 0, 1.75]]),  # Middle of waypoint range [1.0, 2.5]
             initial_rpys=np.zeros((1, 3)),
             physics=Physics.PYB,
             pyb_freq=240,
-            ctrl_freq=30,  # Inner loop at 30 Hz
-            gui=gui,
-            record=False,
-            obs=ObservationType.KIN,
-            act=ActionType.RPM
+            ctrl_freq=48,  # VelocityYawAviary control frequency (internal PID)
+            record=False
         )
         
-        # Initialize DSL PID controller for velocity tracking
-        self.ctrl = DSLPIDControl(drone_model=DroneModel.CF2X)
+        # Override SPEED_LIMIT to match our MAX_VELOCITY (2.0 m/s)
+        # Parent class sets it to ~0.25 m/s which is too slow
+        self.SPEED_LIMIT = self.MAX_VELOCITY
+        print(f"[ActionCoordinator] SPEED_LIMIT set to {self.SPEED_LIMIT} m/s")
         
         # Initialize voxel grid and obstacles
         if self.enable_obstacles:
@@ -146,10 +158,20 @@ class ActionCoordinatorEnv(BaseRLAviary):
     
     def _actionSpace(self):
         """
-        Action: Normalized RPM commands [-1, 1]^4
+        Action: Velocity direction + heading commands [-1, 1]^4
         
-        Commands: [rpm0, rpm1, rpm2, rpm3] for each motor
-        action=0 → hover RPM, action=±1 → hover ±5%
+        CRITICAL: This matches VelocityAviary pattern!
+        
+        Commands: [vx_dir, vy_dir, vz_dir, target_heading]
+        - vx_dir, vy_dir, vz_dir: Velocity DIRECTION (normalized internally)
+        - target_heading: Absolute yaw angle in [-1, 1] → [-π, +π] radians
+        
+        The magnitude of [vx_dir, vy_dir, vz_dir] acts as speed_fraction ∈ [0, 1]
+        Final velocity = SPEED_LIMIT * speed_fraction * normalized_direction
+        
+        Example:
+            [1.0, 0.0, 0.0, 0.0] → Full speed East, heading East
+            [0.5, 0.5, 0.0, 0.5] → Half speed NE, heading 90° right
         
         Returns:
             Box space (4,) in range [-1, 1]
@@ -175,9 +197,17 @@ class ActionCoordinatorEnv(BaseRLAviary):
         GRU learns F=ma dynamics directly without hidden control layers.
             
         Returns:
-            Box space (10,) or (522,) depending on enable_vision
+            Box space (10,) or (10 + vision_size) depending on enable_vision
         """
-        obs_size = 522 if self.enable_vision else 10
+        base_obs_size = 10  # vel(3) + ang_vel(3) + vec_to_wp(3) + compliance(1)
+        
+        if self.enable_vision and self.vision_system is not None:
+            # Calculate vision observation size from downsample dimensions
+            vision_size = self.vision_system.downsample_size[0] * self.vision_system.downsample_size[1]
+            obs_size = base_obs_size + vision_size
+        else:
+            obs_size = base_obs_size
+            
         return spaces.Box(low=-np.inf, high=np.inf, shape=(obs_size,), dtype=np.float32)
     
     def _computeObs(self):
@@ -219,12 +249,11 @@ class ActionCoordinatorEnv(BaseRLAviary):
     
     def _computeReward(self):
         """
-        SPARSE REWARD: Simple pass/fail with minimal shaping
+        OBJECTIVE-ORIENTED REWARDS: Clear goals with strong signals
         
-        Philosophy: Let the agent figure out HOW to fly. We just tell it WHAT to achieve.
-        - Big reward for reaching waypoints
-        - Small time penalty (encourages efficiency)
-        - Everything else (attitude, velocity, smoothness) emerges naturally
+        Primary Goal: Reach waypoints as fast as possible
+        Secondary Goal: Fly forward (stereo vision requirement)
+        Tertiary Goal: Don't crash
         
         Returns:
             float: Total reward
@@ -232,155 +261,87 @@ class ActionCoordinatorEnv(BaseRLAviary):
         state = self._getDroneStateVector(0)
         pos = state[0:3]
         vel = state[10:13]
+        rpy = state[7:10]
         
-        # Start with survival bonus (staying alive has value)
-        reward = 5.0
+        # Initialize reward
+        reward = 0.0
         
-        # CRITICAL: Global altitude safety - prevent ground crashes
-        # Only penalize dangerously low altitude (below 0.5m)
-        # Target altitude shaping is handled separately below
-        min_safe_altitude = 0.2  # Absolute crash threshold
-        danger_zone_start = 0.8  # Start warning below this altitude
-        
-        if pos[2] < danger_zone_start:
-            # Exponential penalty that grows as we approach ground
-            # z=0.8m → 0, z=0.5m → -5, z=0.3m → -20, z=0.2m → -50
-            height_above_crash = max(0.01, pos[2] - min_safe_altitude)
-            reward_global_altitude = -50.0 * np.exp(-height_above_crash / 0.2)
-            reward_global_altitude = np.clip(reward_global_altitude, -50.0, 0.0)
-        else:
-            reward_global_altitude = 0.0
-        
-        reward += reward_global_altitude
-        
-        # Progress reward: Encourage moving toward waypoint
+        # ============================================================================
+        # PRIMARY OBJECTIVE: Reach waypoints (DOMINANT reward component)
+        # ============================================================================
         current_wp = self.waypoints[self.current_waypoint_idx]
         dist = np.linalg.norm(pos - current_wp)
         prev_dist = np.linalg.norm(self.previous_pos - current_wp)
         progress = prev_dist - dist
-        reward_progress = 25.0 * progress  # REDUCED from 10.0 - more subtle shaping
+        
+        # STRONG progress reward: Moving toward waypoint is THE GOAL
+        # At 2 m/s, can move 0.2m per step → reward of +200 per step
+        reward_progress = 1000.0 * progress  # 10x stronger than before
         reward += reward_progress
         
+        # MASSIVE waypoint completion bonus
         if dist < self.waypoint_radius:
-            reward += 400.0  # INCREASED from 200.0 - make success very attractive
+            reward += 10000.0  # 10x stronger - reaching waypoint is SUCCESS
         
-        # Roll/Pitch stability: Encourage level flight (but don't punish too hard)
-        # REDUCED penalties - allow exploration without flipping out
-        roll = state[7]   # Roll angle (rotation about X-axis)
-        pitch = state[8]  # Pitch angle (rotation about Y-axis, positive = nose down)
-        
-        # Roll stability: Gentle penalty for tilting
-        # roll=0°: 0, roll=±15°: -0.21, roll=±30°: -0.43, roll=±45°: -0.48
-        roll_weight = 2.0  # REDUCED from 2.0 - less harsh
-        reward_roll = (1.0 / np.cosh(4.0 * roll) - 1.0) * roll_weight
-        reward += reward_roll
-        
-        # Pitch stability: Allow forward tilt, discourage backward tilt
-        # REDUCED weight - don't punish exploration
-        pitch_weight = 2.0  # REDUCED from 2.0 - less harsh
-        reward_pitch = ((np.tanh(12.0 * pitch * np.pi + 5) - 3.0) / 2.0 + 
-                        1.0 / np.cosh(2.0 * pitch)) * pitch_weight
-        reward += reward_pitch
-        
-        # Target altitude shaping: Guide drone toward waypoint's altitude
-        # This is SEPARATE from crash prevention - shapes toward target height
-        target_altitude = current_wp[2]
-        altitude_error = abs(pos[2] - target_altitude)
-        
-        # ALWAYS encourage matching target altitude (not distance-scaled)
-        # Being at wrong altitude makes navigation harder
-        # z_error=0m → 0, z_error=0.5m → -1.25, z_error=1.0m → -2.5, z_error=2.0m → -5.0
-        altitude_weight = 2.5  # INCREASED - altitude matching is important for navigation
-        reward_altitude = -altitude_weight * altitude_error
-        reward += reward_altitude
-        
-        # SIMPLIFIED VELOCITY REWARDS
-        # 1. Reward forward motion (body frame - for stereo vision)
-        # 2. Reward moving toward waypoint (prioritize Z over XY)
-        
-        # Forward motion reward (body frame)
-        # Stereo camera is on front of drone, so encourage forward flight
-        rpy = state[7:10]
-        yaw = rpy[2]
-        
+        # ============================================================================
+        # SECONDARY OBJECTIVE: Fly forward (stereo vision requirement)
+        # ============================================================================
         # Body-frame forward direction (positive X in body frame)
+        yaw = rpy[2]
         forward_dir = np.array([np.cos(yaw), np.sin(yaw), 0.0])
         vel_forward = np.dot(vel, forward_dir)
         
-        forward_weight = 1.0
-        reward_forward = forward_weight * vel_forward  # Reward forward speed
+        # LINEAR RAMP: Reward increases smoothly from 0
+        # This makes it easier to learn - any forward motion is rewarded proportionally
+        # IMPORTANT: This should be MUCH weaker than progress reward (1000.0)
+        # We want the agent to prioritize reaching waypoints over flying forward
+        forward_weight = 50.0  # Reduced 5x - progress toward waypoint is more important
+        reward_forward = forward_weight * vel_forward  # Linear: 0 at stationary, +20 at 2 m/s
+        
+        # NO backward penalty - let the agent move however it needs to reach waypoints
+        # The stereo vision is a nice-to-have, not a hard requirement
+        # Waypoint progress (1000x) is 100x stronger than forward penalty anyway
+        
         reward += reward_forward
         
-        # Target alignment reward (constant weight)
-        # Decompose velocity toward waypoint into horizontal and vertical components
-        direction_to_wp = (current_wp - pos) / (dist + 1e-6)
+        # ============================================================================
+        # TERTIARY OBJECTIVE: Time penalty (encourages speed)
+        # ============================================================================
+        # Small constant penalty per timestep - encourages completing mission quickly
+        reward_time = -1.0  # -1 per step, -500 total if using all 500 steps
+        reward += reward_time
         
-        # Horizontal (XY) alignment
-        direction_to_wp_xy = direction_to_wp[:2]
-        direction_to_wp_xy_norm = np.linalg.norm(direction_to_wp_xy)
-        if direction_to_wp_xy_norm > 0.01:
-            direction_to_wp_xy = direction_to_wp_xy / direction_to_wp_xy_norm
-            vel_toward_wp_xy = np.dot(vel[:2], direction_to_wp_xy)
+        # ============================================================================
+        # SAFETY: Crash avoidance (only penalize dangerous situations)
+        # ============================================================================
+        # Ground proximity penalty (only when dangerously low)
+        min_safe_altitude = 0.2
+        danger_zone_start = 0.5  # Start warning below 0.5m
+        
+        if pos[2] < danger_zone_start:
+            height_above_crash = max(0.01, pos[2] - min_safe_altitude)
+            reward_ground_danger = -500.0 * np.exp(-height_above_crash / 0.2)
         else:
-            vel_toward_wp_xy = 0.0
+            reward_ground_danger = 0.0
         
-        # Vertical (Z) alignment
-        vel_toward_wp_z = vel[2] * np.sign(direction_to_wp[2])  # Positive when moving in correct Z direction
+        reward += reward_ground_danger
         
-        # Reward with Z weighted more heavily than XY
-        xy_alignment_weight = 0.3  # Small reward for horizontal alignment
-        z_alignment_weight = 1.0   # Larger reward for vertical alignment
-        
-        reward_vel_align = (xy_alignment_weight * vel_toward_wp_xy + 
-                           z_alignment_weight * vel_toward_wp_z)
-        reward += reward_vel_align
-        
-        # Store for metrics
+        # ============================================================================
+        # Store metrics for logging
+        # ============================================================================
+        roll = rpy[0]
+        pitch = rpy[1]
         speed = np.linalg.norm(vel)
+        direction_to_wp = (current_wp - pos) / (dist + 1e-6)
         alignment = np.dot(vel, direction_to_wp) / (speed + 1e-6) if speed > 0.1 else 0.0
         
-        # Speed reward: Encourage flying at reasonable speed (not too slow, not too fast)
-        # Constant reward when speed is below max travel speed
-        max_travel_speed = 1.0  # m/s - reasonable cruising speed
-        speed_weight = 1.0
-        
-        if speed < max_travel_speed:
-            # Reward for controlled flight at safe speed
-            reward_speed_limit = speed_weight * 1.0
-        else:
-            # Penalty for excessive speed (dangerous, hard to control)
-            overspeed_factor = (speed - max_travel_speed) / max_travel_speed
-            reward_speed_limit = -speed_weight * overspeed_factor
-        
-        reward += reward_speed_limit
-        
-        # RPM symmetry penalty: Encourage balanced rotor speeds
-        # Penalize deviation from the MEAN rotor speed (not hover)
-        # This encourages symmetric control while allowing altitude changes
-        # Example: [0.5, 0.5, 0.5, 0.5] → penalty ≈ 0 (all same, good!)
-        # Example: [1.0, 1.0, 1.0, 1.0] → penalty ≈ 0 (all same, climbing uniformly)
-        # Example: [1.0, 0.0, 1.0, 0.0] → penalty ≈ -0.05 (asymmetric, discouraged)
-        mean_action = np.mean(self._current_action)
-        action_variance = np.sum((self._current_action - mean_action)**2)
-        rpm_symmetry_weight = 0.05  # Gentle encouragement for symmetric control
-        reward_rpm_deviation = -rpm_symmetry_weight * action_variance
-        reward += reward_rpm_deviation
-        
-        # Hover reward: ONLY on the final waypoint (encourages continuous motion through checkpoints)
-        # First waypoints: pass through quickly (no hover reward)
-        # Last waypoint: hover for massive sustained reward
+        reward_roll = 0.0  # Disabled - agent doesn't control orientation
+        reward_pitch = 0.0  # Disabled
+        reward_altitude = 0.0  # Disabled - waypoint 3D position is enough
+        reward_vel_align = 0.0  # Disabled - progress reward handles this
+        reward_hover = 0.0  # Disabled - not needed
+        reward_overspeed = 0.0  # Disabled - action space limits speed
         is_final_waypoint = (self.current_waypoint_idx == len(self.waypoints) - 1)
-        
-        if is_final_waypoint:
-            # Final waypoint: Massive bonus for staying near target
-            # Exponential reward: closer = better, with smooth falloff
-            # dist=0.1m → 50.0, dist=0.5m → 44.1, dist=1.0m → 30.3, dist>2m → ~0
-            hover_weight = 50.0
-            reward_hover = hover_weight * np.exp(-dist**2 / (2 * self.waypoint_radius**2))
-            reward += reward_hover
-        else:
-            # Intermediate waypoints: No hover reward
-            reward_hover = 0.0
         
         # Store metrics for logging
         vel_toward_wp = np.dot(vel, direction_to_wp)
@@ -390,26 +351,29 @@ class ActionCoordinatorEnv(BaseRLAviary):
         accel_magnitude = np.linalg.norm(accel)
         altitude = pos[2]
         
-        # Store components for metrics
-        vel_toward_wp = vel_toward_wp_xy + vel_toward_wp_z  # Combined for logging
+        # Store metrics for logging
+        vel_toward_wp = np.dot(vel, direction_to_wp)
         vel_lateral = vel - vel_toward_wp * direction_to_wp
         vel_lateral_mag = np.linalg.norm(vel_lateral)
         accel = (vel - self.previous_vel) / (1.0 / self.control_freq)
         accel_magnitude = np.linalg.norm(accel)
+        altitude = pos[2]
+        altitude_error = 0.0  # Not used anymore
         
         self._progress = progress
         self._reward_progress = reward_progress
         self._vel_toward_wp = vel_toward_wp
         self._vel_lateral_mag = vel_lateral_mag
         self._accel_magnitude = accel_magnitude
-        self._vel_forward = vel_forward  # Body-frame forward velocity
-        self._reward_forward = reward_forward  # Body-frame forward reward
+        self._vel_forward = vel_forward
+        self._reward_forward = reward_forward
+        self._reward_time = reward_time
         self._reward_hover = reward_hover
-        self._distance_factor = 0.0  # Removed distance scaling
+        self._distance_factor = 0.0
         self._alignment = alignment
-        self._alignment_scale = 1.0  # Constant now
+        self._alignment_scale = 1.0
         self._reward_vel_align = reward_vel_align
-        self._misalignment_factor = 0.0  # Removed
+        self._misalignment_factor = 0.0
         self._reward_lateral = 0.0
         self._reward_accel = 0.0
         self._roll = roll
@@ -420,9 +384,8 @@ class ActionCoordinatorEnv(BaseRLAviary):
         self._altitude_error = altitude_error
         self._reward_altitude = reward_altitude
         self._speed = speed
-        self._reward_speed_limit = 0.0  # Removed speed limit penalty
-        self._reward_global_altitude = reward_global_altitude
-        self._reward_rpm_deviation = reward_rpm_deviation
+        self._reward_overspeed = reward_overspeed
+        self._reward_global_altitude = reward_ground_danger
         
         # Obstacle proximity penalty (if voxel grid available)
         reward_obstacle = 0.0
@@ -559,41 +522,91 @@ class ActionCoordinatorEnv(BaseRLAviary):
             'reward_altitude': getattr(self, '_reward_altitude', 0.0),
             'altitude_error': getattr(self, '_altitude_error', 0.0),
             'speed': getattr(self, '_speed', 0.0),
-            'reward_speed_limit': getattr(self, '_reward_speed_limit', 0.0),
+            'reward_overspeed': getattr(self, '_reward_overspeed', 0.0),
             'action_change': getattr(self, '_action_change', 0.0),
             'reward_smoothness': getattr(self, '_reward_smoothness', 0.0),
             'reward_hover': getattr(self, '_reward_hover', 0.0),
             'distance_factor': getattr(self, '_distance_factor', 0.0),
             'reward_global_altitude': getattr(self, '_reward_global_altitude', 0.0),
-            'reward_rpm_deviation': getattr(self, '_reward_rpm_deviation', 0.0),
+            # Velocity tracking metrics
+            'target_velocity_mag': np.linalg.norm(self.target_velocity),
+            'actual_velocity_mag': np.linalg.norm(self._getDroneStateVector(0)[10:13]),
+            'velocity_tracking_error': self.velocity_tracking_error,
         }
     
     def _preprocessAction(self, action):
         """
-        Convert normalized action to RPM commands.
+        Convert normalized action to RPM commands via velocity control.
         
-        Simple direct mapping: action ∈ [-1, 1] → RPM = HOVER_RPM * (1 + action * 0.06)
-        Also tracks action for smoothness penalty.
+        CRITICAL: This must match the exact pattern from VelocityAviary and test files!
+        
+        Action format (from agent): [vx_dir, vy_dir, vz_dir, target_heading]
+        - First 3 components: velocity DIRECTION (will be normalized)
+        - 4th component: target heading angle (scaled to ±π)
+        
+        Process (matching VelocityAviary.py line 164):
+        1. Normalize velocity direction vector (first 3 components)
+        2. Compute speed_fraction from action magnitude
+        3. Call PID with target_pos=current_pos (velocity-only control)
+        4. Set target_vel = SPEED_LIMIT * speed_fraction * v_unit_vector
+        5. Set target_yaw from action[3]
         
         Args:
-            action: Normalized RPM commands [-1, 1]^4
+            action: Normalized commands [-1, 1]^4 = [vx, vy, vz, target_heading]
             
         Returns:
-            RPM array (1, 4)
+            RPM array (1, 4) for motors
         """
-        # Store current action for smoothness reward calculation (before update)
+        # Store current action for smoothness reward calculation
         self._current_action = action.copy()
         
-        # Direct RPM mapping: action=0 → hover, action=±1 → hover ±5%
-        rpm = self.HOVER_RPM * (1.0 + action * self.RPM_VARIATION)
+        # Get current drone state
+        state = self._getDroneStateVector(0)
         
-        # Clip to valid range (avoid negative RPMs)
-        rpm = np.clip(rpm, 0, self.HOVER_RPM * 1.2)
+        # Extract velocity direction and heading from action
+        # action[0:3] is velocity DIRECTION (can be any magnitude in [-1,1])
+        # action[3] is target heading angle in [-1, 1] → scaled to [-π, π]
+        velocity_dir = action[0:3]
+        target_heading = action[3] * np.pi  # Scale to radians
+        
+        # Normalize velocity direction (EXACTLY like VelocityAviary line 158-161)
+        if np.linalg.norm(velocity_dir) != 0:
+            v_unit_vector = velocity_dir / np.linalg.norm(velocity_dir)
+        else:
+            v_unit_vector = np.zeros(3)
+        
+        # Compute speed_fraction from action magnitude (how fast to go in that direction)
+        # Use the magnitude of the velocity command as the speed fraction
+        speed_fraction = np.clip(np.linalg.norm(velocity_dir), 0.0, 1.0)
+        
+        # Compute target velocity (EXACTLY like VelocityAviary line 172)
+        target_vel = self.SPEED_LIMIT * speed_fraction * v_unit_vector
+        
+        # Store target velocity for tracking metrics
+        self.target_velocity = target_vel.copy()
+        
+        # Compute velocity tracking error (will be used in step())
+        actual_vel = state[10:13]
+        self.velocity_tracking_error = np.linalg.norm(target_vel - actual_vel)
+        
+        # Call PID controller directly (EXACTLY like VelocityAviary line 164-172)
+        # CRITICAL: target_pos = current_pos (NO position tracking, pure velocity control)
+        rpm_single, _, _ = self.ctrl[0].computeControl(
+            control_timestep=self.CTRL_TIMESTEP,
+            cur_pos=state[0:3],
+            cur_quat=state[3:7],
+            cur_vel=state[10:13],
+            cur_ang_vel=state[13:16],
+            target_pos=state[0:3],  # CRITICAL: Same as current position (velocity-only)
+            target_rpy=np.array([0, 0, target_heading]),  # Control yaw, keep roll/pitch=0
+            target_vel=target_vel  # Target velocity vector
+        )
         
         # Update previous action for next step's smoothness calculation
         self.previous_action = action.copy()
         
-        return rpm.reshape(1, 4)
+        # Return as (1, 4) array for single drone
+        return rpm_single.reshape(1, 4)
     
     def reset(self, seed=None, options=None):
         """Reset environment with new waypoint path and obstacles."""
@@ -606,6 +619,10 @@ class ActionCoordinatorEnv(BaseRLAviary):
         self.previous_action = np.zeros(4)
         self.compliance = 1.0
         self._crash_type = None
+        
+        # Reset velocity tracking metrics
+        self.target_velocity = np.zeros(3)
+        self.velocity_tracking_error = 0.0
         
         # Initialize empty waypoints so _computeObs() doesn't crash
         self.waypoints = [np.array([0.0, 0.0, 1.75]) for _ in range(5)]
@@ -670,15 +687,42 @@ class ActionCoordinatorEnv(BaseRLAviary):
                 ])
                 self.waypoints.append(wp)
         
-        # CRITICAL FIX: Initialize rotors at hover speed so drone doesn't fall
-        # BaseAviary.reset() sets last_clipped_action to zeros, causing immediate drop
-        # Apply hover action immediately to stabilize drone
-        hover_action = np.ones(4) * self.HOVER_RPM
-        for _ in range(10):  # Let drone stabilize for ~0.3 seconds
-            self._physics(hover_action, 0)
-        self.last_clipped_action = np.ones((self.NUM_DRONES, 4)) * self.HOVER_RPM
+        # Curriculum: Add random initial velocity after some training
+        # This helps the agent learn to handle momentum and breaks hover bias
+        # Start with 30% probability, increase to 70% over time
+        init_velocity_probability = np.clip(
+            0.3 + (self.curriculum_timesteps / 500_000) * 0.4,  # 30% → 70% over 500k steps
+            0.3, 0.7
+        )
         
-        # Recompute observation after stabilization
+        if np.random.random() < init_velocity_probability:
+            # Apply random initial velocity
+            # Magnitude: 0.2 to 1.0 m/s (not too fast, not static)
+            velocity_magnitude = np.random.uniform(0.2, 1.0)
+            
+            # Random direction (horizontal bias - less vertical velocity)
+            velocity_direction = np.array([
+                np.random.uniform(-1, 1),      # X
+                np.random.uniform(-1, 1),      # Y  
+                np.random.uniform(-0.3, 0.3)   # Z (smaller range - avoid ground/ceiling)
+            ])
+            velocity_direction = velocity_direction / np.linalg.norm(velocity_direction)
+            
+            initial_velocity = velocity_magnitude * velocity_direction
+            
+            # Apply velocity to drone using PyBullet
+            import pybullet as p
+            p.resetBaseVelocity(
+                self.DRONE_IDS[0],
+                linearVelocity=initial_velocity,
+                angularVelocity=[0, 0, 0],  # No initial spin
+                physicsClientId=self.CLIENT
+            )
+            
+            # Update previous_vel so reward calculation is consistent
+            self.previous_vel = initial_velocity.copy()
+        
+        # Recompute observation
         obs = self._computeObs()
         
         return obs, info
@@ -716,11 +760,14 @@ class ActionCoordinatorEnv(BaseRLAviary):
         """
         Execute one control step.
         
-        Action coordinator runs at 10 Hz, but physics at 30 Hz,
-        so we repeat the velocity command for 3 physics steps.
+        Action coordinator runs at 10 Hz with direct heading control.
+        No integration needed - agent directly specifies target heading.
         """
         self.current_step += 1
         self.curriculum_timesteps += 1  # Track total timesteps for curriculum
+        
+        # No yaw integration needed - action[3] is already absolute heading!
+        # _preprocessAction will handle scaling to [-π, +π]
         
         # Curriculum learning: Randomly perturb waypoints after 1M timesteps
         waypoint_perturbed = False
@@ -732,19 +779,19 @@ class ActionCoordinatorEnv(BaseRLAviary):
                 perturbation_magnitude = np.linalg.norm(perturbation)
                 waypoint_perturbed = True
         
-        # Calculate smoothness penalty BEFORE stepping (so we have previous_action)
+        # Action smoothness: DISABLED - PID controller handles smooth transitions
+        # Agent should be free to make rapid velocity/heading changes when needed
         action_change = action - self.previous_action
         action_change_magnitude = np.linalg.norm(action_change)
-        smoothness_weight = 0.5
-        reward_smoothness = -smoothness_weight * action_change_magnitude
+        reward_smoothness = 0.0  # Disabled
         
-        # Execute action for 3 substeps (10 Hz coordinator, 30 Hz physics)
+        # Execute action - _preprocessAction will be called by parent
+        # and will use the target_yaw we just computed
         obs, reward, terminated, truncated, info = super().step(action)
         
-        # Add smoothness reward to total reward
-        reward += reward_smoothness
+        # Smoothness reward disabled (no change to total reward)
         
-        # Store smoothness metrics in info
+        # Store smoothness metrics in info (for logging only)
         info['action_change'] = action_change_magnitude
         info['reward_smoothness'] = reward_smoothness
         
@@ -752,6 +799,13 @@ class ActionCoordinatorEnv(BaseRLAviary):
         info['waypoint_perturbed'] = waypoint_perturbed
         info['perturbation_magnitude'] = perturbation_magnitude
         info['curriculum_timesteps'] = self.curriculum_timesteps
+        
+        # CRITICAL FIX: Update velocity tracking metrics AFTER super().step()
+        # _preprocessAction() was called during super().step() and updated these values
+        # Now we need to add them to the info dict that will be returned
+        info['target_velocity_mag'] = np.linalg.norm(self.target_velocity)
+        info['actual_velocity_mag'] = np.linalg.norm(self._getDroneStateVector(0)[10:13])
+        info['velocity_tracking_error'] = self.velocity_tracking_error
         
         # Crash penalty: Apply appropriate penalty based on crash type
         # Waypoint reward (+300) should dominate to ensure positive learning signal

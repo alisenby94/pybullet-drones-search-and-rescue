@@ -246,7 +246,7 @@ def create_action_coordinator(env, learning_rate=3e-4, verbose=1, use_recurrent=
                 n_steps=256,  # Smaller batches = more frequent updates with fresher data
                 batch_size=128,  # Larger mini-batches = more stable gradients, less noise
                 n_epochs=10,
-                gamma=0.997,  # Higher discount = values long-term survival (0.997^500 ≈ 22%)
+                gamma=0.99,  # Higher discount = values long-term survival (0.99^500 ≈ 0.65%)
                 gae_lambda=0.95,
                 clip_range=0.2,
                 ent_coef=0.0,

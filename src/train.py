@@ -108,27 +108,55 @@ def train(timesteps=1000000, name="coordinator_v1", coord_seed=None, n_envs=8):
     # Create or load coordinator model
     print("Creating coordinator model...")
     
-    if coord_seed and os.path.exists(coord_seed + ".zip"):
-        print(f"  Loading coordinator model from {coord_seed}")
-        # Try RecurrentPPO first (current architecture), fall back to PPO
-        try:
-            coord_model = RecurrentPPO.load(coord_seed, env=coord_env)
-            print(f"  Loaded as RecurrentPPO (GRU architecture)")
-            # Re-enable TensorBoard logging for loaded model
-            coord_model.tensorboard_log = "./logs/action_coordinator_gru"
-        except Exception as e:
-            print(f"  RecurrentPPO load failed, trying PPO: {e}")
-            coord_model = PPO.load(coord_seed, env=coord_env)
-            print(f"  Loaded as PPO")
-            # Re-enable TensorBoard logging for loaded model
-            coord_model.tensorboard_log = "./logs/action_coordinator"
+    # Handle both with and without .zip extension
+    if coord_seed:
+        # Remove .zip if present (stable-baselines3 adds it automatically)
+        if coord_seed.endswith('.zip'):
+            coord_seed_path = coord_seed[:-4]
+        else:
+            coord_seed_path = coord_seed
+        
+        # Check if file exists (with .zip extension)
+        if os.path.exists(coord_seed_path + ".zip"):
+            print(f"  Loading coordinator model from {coord_seed_path}.zip")
+            # Try RecurrentPPO first (current architecture), fall back to PPO
+            try:
+                coord_model = RecurrentPPO.load(coord_seed_path, env=coord_env)
+                print(f"  Loaded as RecurrentPPO (GRU architecture)")
+                # Re-enable TensorBoard logging for loaded model
+                coord_model.tensorboard_log = "./logs/action_coordinator_gru"
+                
+                # CRITICAL: Reset rollout buffer when resuming training
+                # The loaded model has policy weights from checkpoint (good!)
+                # But rollout buffer may have old transitions with old reward function (bad!)
+                # Force fresh data collection with new reward parameters
+                print(f"  Resetting rollout buffer to collect fresh data with current reward function")
+                coord_model.rollout_buffer.reset()
+                
+            except Exception as e:
+                print(f"  RecurrentPPO load failed, trying PPO: {e}")
+                coord_model = PPO.load(coord_seed_path, env=coord_env)
+                print(f"  Loaded as PPO")
+                # Re-enable TensorBoard logging for loaded model
+                coord_model.tensorboard_log = "./logs/action_coordinator"
+                
+                # Reset rollout buffer for PPO too
+                print(f"  Resetting rollout buffer to collect fresh data with current reward function")
+                coord_model.rollout_buffer.reset()
+        else:
+            print(f"  Warning: Coordinator seed {coord_seed_path}.zip not found, creating new model")
+            coord_model = create_action_coordinator(coord_env, verbose=2)  # Max verbosity for debugging
     else:
-        if coord_seed:
-            print(f"  Warning: Coordinator seed {coord_seed} not found, creating new model")
         coord_model = create_action_coordinator(coord_env, verbose=2)  # Max verbosity for debugging
     
     print(f"  Model tensorboard_log: {coord_model.tensorboard_log}")
     print(f"  Model verbose: {coord_model.verbose}")
+    
+    # When resuming from checkpoint with new reward parameters:
+    # ✓ Policy weights preserved (learned behavior)
+    # ✓ Value function preserved (learned V(s) estimates)
+    # ✓ Optimizer state preserved (learning rate schedule, momentum)
+    # ✗ Rollout buffer reset (fresh data with new rewards)
     
     # Initialize metrics
     coord_metrics = TrainingMetrics(stage="coordinator")
@@ -148,7 +176,7 @@ def train(timesteps=1000000, name="coordinator_v1", coord_seed=None, n_envs=8):
     # VecMonitor handles episode reward and length automatically
     coord_callbacks = CallbackList([
         checkpoint_callback,
-        WaypointMetricsCallback(verbose=0)
+        WaypointMetricsCallback(verbose=1)  # Enable console output for action statistics
     ])
     
     total_steps = 0
@@ -163,22 +191,35 @@ def train(timesteps=1000000, name="coordinator_v1", coord_seed=None, n_envs=8):
         print(f"{'='*60}\n")
         
         if stage == "coordinator":
-            # Create fresh parallel environments for coordinator training
-            if n_envs > 1:
-                coord_env_updated = SubprocVecEnv([make_env() for _ in range(n_envs)])
-            else:
-                coord_env_updated = DummyVecEnv([make_env()])
+            # ONLY recreate environment if we're NOT on the first phase from checkpoint
+            # First phase from checkpoint: use environment already set during model load
+            # Subsequent phases: recreate to ensure clean state
+            is_first_phase_from_checkpoint = (total_steps == 0 and coord_seed is not None)
             
-            # Wrap with VecMonitor for proper logging
-            coord_env_updated = VecMonitor(coord_env_updated, info_keywords=())  # Disable info logging to prevent conflicts
-            coord_model.set_env(coord_env_updated)
+            if not is_first_phase_from_checkpoint:
+                print(f"  Creating fresh parallel environments for this phase")
+                if n_envs > 1:
+                    coord_env_updated = SubprocVecEnv([make_env() for _ in range(n_envs)])
+                else:
+                    coord_env_updated = DummyVecEnv([make_env()])
+                
+                # Wrap with VecMonitor for proper logging
+                coord_env_updated = VecMonitor(coord_env_updated, info_keywords=())
+                coord_model.set_env(coord_env_updated)
+            else:
+                print(f"  Using environment from checkpoint load (preserving setup)")
+                coord_env_updated = None  # Will use coord_env from initial load
             
             # Train coordinator
             print(f"  Training with TensorBoard logging to: {coord_model.tensorboard_log}")
-            # Note: reset_num_timesteps must be True for first call to initialize logger
+            # CRITICAL: When loading from checkpoint, reset_num_timesteps=False to preserve training state
+            # Only reset on very first call when starting from scratch
+            should_reset = (total_steps == 0 and coord_seed is None)
+            print(f"  reset_num_timesteps: {should_reset} (checkpoint: {coord_seed is not None}, total_steps: {total_steps})")
+            
             coord_model.learn(
                 total_timesteps=steps,
-                reset_num_timesteps=(total_steps == 0),  # True for first phase only
+                reset_num_timesteps=should_reset,  # False when resuming from checkpoint!
                 progress_bar=True,
                 callback=coord_callbacks,
                 tb_log_name=name  # Add run name for TensorBoard
@@ -194,7 +235,9 @@ def train(timesteps=1000000, name="coordinator_v1", coord_seed=None, n_envs=8):
             # Save checkpoint
             coord_model.save(f"models/{name}_coordinator_{total_steps}")
             
-            coord_env_updated.close()
+            # Close environment if we created a new one this phase
+            if coord_env_updated is not None:
+                coord_env_updated.close()
     
     # Save final model
     print("\nSaving final model...")

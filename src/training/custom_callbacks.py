@@ -7,14 +7,43 @@ from stable_baselines3.common.callbacks import BaseCallback
 class WaypointMetricsCallback(BaseCallback):
     """
     Log current waypoint metrics every rollout (don't wait for episode completion).
+    Also logs velocity tracking metrics.
     """
     
     def __init__(self, verbose=0):
         super().__init__(verbose)
         self.rollout_count = 0
+        self.print_frequency = 10  # Print action stats every N rollouts
+        
+        # Velocity tracking metrics (collected at every step)
+        self.rollout_velocity_errors = []
+        self.rollout_target_mags = []
+        self.rollout_actual_mags = []
     
     def _on_step(self) -> bool:
-        """Required by BaseCallback. We do logging in _on_rollout_end instead."""
+        """Collect velocity tracking metrics every step."""
+        # Get info from all environments
+        infos = self.locals.get("infos", [])
+        
+        # Handle case where infos is None, a tuple, or not a list
+        if infos is None:
+            infos = []
+        elif isinstance(infos, tuple):
+            infos = list(infos)  # Convert tuple to list
+        elif not isinstance(infos, list):
+            infos = [infos]  # Wrap single item in list
+        
+        # Collect velocity tracking metrics from each environment
+        for info in infos:
+            if info is None or not isinstance(info, dict):
+                continue
+            
+            # Collect velocity tracking metrics
+            if 'velocity_tracking_error' in info:
+                self.rollout_velocity_errors.append(info['velocity_tracking_error'])
+                self.rollout_target_mags.append(info['target_velocity_mag'])
+                self.rollout_actual_mags.append(info['actual_velocity_mag'])
+        
         return True
         
     def _on_rollout_end(self) -> None:
@@ -31,6 +60,14 @@ class WaypointMetricsCallback(BaseCallback):
         distances = []
         waypoints_reached = []
         
+        # Reward component tracking
+        reward_forward_velocity = []
+        reward_distance = []
+        reward_alignment = []
+        reward_waypoint_completion = []
+        reward_altitude = []
+        reward_obstacle_penalty = []
+        
         for info in infos:
             if info is None:
                 continue
@@ -40,6 +77,20 @@ class WaypointMetricsCallback(BaseCallback):
             
             if 'waypoints_reached' in info:
                 waypoints_reached.append(info['waypoints_reached'])
+            
+            # Collect reward components
+            if 'reward_forward_velocity' in info:
+                reward_forward_velocity.append(info['reward_forward_velocity'])
+            if 'reward_distance' in info:
+                reward_distance.append(info['reward_distance'])
+            if 'reward_alignment' in info:
+                reward_alignment.append(info['reward_alignment'])
+            if 'reward_waypoint_completion' in info:
+                reward_waypoint_completion.append(info['reward_waypoint_completion'])
+            if 'reward_altitude' in info:
+                reward_altitude.append(info['reward_altitude'])
+            if 'reward_obstacle_penalty' in info:
+                reward_obstacle_penalty.append(info['reward_obstacle_penalty'])
         
         # Log aggregated metrics
         if distances:
@@ -51,6 +102,95 @@ class WaypointMetricsCallback(BaseCallback):
             self.logger.record("waypoint/reached_mean", np.mean(waypoints_reached))
             self.logger.record("waypoint/reached_max", np.max(waypoints_reached))
             self.logger.record("waypoint/reached_total", np.sum(waypoints_reached))
+        
+        # Log reward component breakdown
+        if reward_forward_velocity:
+            self.logger.record("reward_components/forward_velocity_mean", np.mean(reward_forward_velocity))
+        if reward_distance:
+            self.logger.record("reward_components/distance_mean", np.mean(reward_distance))
+        if reward_alignment:
+            self.logger.record("reward_components/alignment_mean", np.mean(reward_alignment))
+        if reward_waypoint_completion:
+            # Log the raw reward mean (mostly 0, spiky at 1000)
+            self.logger.record("reward_components/waypoint_completion_mean", np.mean(reward_waypoint_completion))
+            # Log completion rate: what % of steps captured a waypoint
+            completions = [1 if r > 0 else 0 for r in reward_waypoint_completion]
+            completion_rate = np.mean(completions) * 100  # As percentage
+            self.logger.record("waypoint/completion_rate_percent", completion_rate)
+            # Log total completions in this rollout
+            total_completions = np.sum(completions)
+            self.logger.record("waypoint/completions_this_rollout", total_completions)
+        if reward_altitude:
+            self.logger.record("reward_components/altitude_mean", np.mean(reward_altitude))
+        if reward_obstacle_penalty:
+            self.logger.record("reward_components/obstacle_penalty_mean", np.mean(reward_obstacle_penalty))
+        
+        # Log action statistics from rollout buffer
+        # Actions are stored in the buffer during rollout collection
+        # Get the raw actions (before scaling) from the rollout buffer
+        if hasattr(self.model, 'rollout_buffer') and self.model.rollout_buffer.full:
+            actions = self.model.rollout_buffer.actions
+            
+            # actions shape: (buffer_size, n_envs, action_dim) or (buffer_size * n_envs, action_dim)
+            # Flatten to (N, action_dim) for statistics
+            actions_flat = actions.reshape(-1, actions.shape[-1])
+            
+            # Compute statistics per action dimension
+            # Action space: [vx, vy, vz] in range [-1, 1] (3D velocity)
+            action_names = ['vx', 'vy', 'vz']
+            
+            for i, name in enumerate(action_names):
+                if i < actions_flat.shape[1]:  # Safety check for dimension
+                    action_dim = actions_flat[:, i]
+                    self.logger.record(f"action/{name}_mean", np.mean(action_dim))
+                    self.logger.record(f"action/{name}_min", np.min(action_dim))
+                    self.logger.record(f"action/{name}_max", np.max(action_dim))
+                    self.logger.record(f"action/{name}_std", np.std(action_dim))
+                    self.logger.record(f"action/{name}_abs_mean", np.mean(np.abs(action_dim)))
+            
+            # Overall action magnitude (L2 norm of velocity components)
+            action_magnitude = np.sqrt(np.sum(actions_flat[:, :3]**2, axis=1))
+            self.logger.record("action/magnitude_mean", np.mean(action_magnitude))
+            self.logger.record("action/magnitude_min", np.min(action_magnitude))
+            self.logger.record("action/magnitude_max", np.max(action_magnitude))
+            
+            # Action utilization: percentage of max action (1.0) being used
+            # This tells us if the model is being conservative (low %) or aggressive (high %)
+            action_utilization = np.mean(action_magnitude) / 1.0  # Max magnitude in [-1,1]^3 space
+            self.logger.record("action/utilization", action_utilization * 100)  # As percentage
+            
+            # Print action statistics to console periodically
+            if self.verbose > 0 and self.rollout_count % self.print_frequency == 0:
+                print(f"\n{'='*80}")
+                print(f"ACTION STATISTICS (Rollout {self.rollout_count})")
+                print(f"{'='*80}")
+                print(f"  vx:      mean={np.mean(actions_flat[:, 0]):+.3f}  min={np.min(actions_flat[:, 0]):+.3f}  max={np.max(actions_flat[:, 0]):+.3f}  std={np.std(actions_flat[:, 0]):.3f}")
+                print(f"  vy:      mean={np.mean(actions_flat[:, 1]):+.3f}  min={np.min(actions_flat[:, 1]):+.3f}  max={np.max(actions_flat[:, 1]):+.3f}  std={np.std(actions_flat[:, 1]):.3f}")
+                print(f"  vz:      mean={np.mean(actions_flat[:, 2]):+.3f}  min={np.min(actions_flat[:, 2]):+.3f}  max={np.max(actions_flat[:, 2]):+.3f}  std={np.std(actions_flat[:, 2]):.3f}")
+                print(f"  Magnitude: mean={np.mean(action_magnitude):.3f}  min={np.min(action_magnitude):.3f}  max={np.max(action_magnitude):.3f}")
+                print(f"  Utilization: {action_utilization * 100:.1f}% of maximum")
+                print(f"{'='*80}\n")
+        
+        # Log velocity tracking metrics (collected every step during rollout)
+        if self.rollout_velocity_errors:
+            self.logger.record("velocity/tracking_error_mean", np.mean(self.rollout_velocity_errors))
+            self.logger.record("velocity/tracking_error_max", np.max(self.rollout_velocity_errors))
+            self.logger.record("velocity/tracking_error_std", np.std(self.rollout_velocity_errors))
+            # Clear for next rollout
+            self.rollout_velocity_errors = []
+        
+        if self.rollout_target_mags:
+            self.logger.record("velocity/target_magnitude_mean", np.mean(self.rollout_target_mags))
+            self.logger.record("velocity/target_magnitude_max", np.max(self.rollout_target_mags))
+            # Clear for next rollout
+            self.rollout_target_mags = []
+        
+        if self.rollout_actual_mags:
+            self.logger.record("velocity/actual_magnitude_mean", np.mean(self.rollout_actual_mags))
+            self.logger.record("velocity/actual_magnitude_max", np.max(self.rollout_actual_mags))
+            self.logger.record("velocity/actual_magnitude_std", np.std(self.rollout_actual_mags))
+            # Clear for next rollout
+            self.rollout_actual_mags = []
 
 
 class DetailedMetricsCallback(BaseCallback):
@@ -72,6 +212,11 @@ class DetailedMetricsCallback(BaseCallback):
         self.total_obstacle_crashes = 0
         self.total_general_crashes = 0
         
+        # Rollout-level velocity tracking (collected every step)
+        self.rollout_velocity_errors = []
+        self.rollout_target_mags = []
+        self.rollout_actual_mags = []
+        
     def _on_step(self) -> bool:
         """
         Called after each step in the environment.
@@ -79,12 +224,16 @@ class DetailedMetricsCallback(BaseCallback):
         Collects metrics from info dict and logs them when episode ends.
         """
         # Get info from all environments (handles vectorized envs)
-        # For SubprocVecEnv, infos may be a list of dicts or empty
+        # For SubprocVecEnv, infos may be a tuple or list of dicts
         infos = self.locals.get("infos", [])
         
-        # Handle case where infos is None or not a list
-        if not isinstance(infos, list):
-            infos = [infos] if infos is not None else []
+        # Handle case where infos is None, a tuple, or not a list
+        if infos is None:
+            infos = []
+        elif isinstance(infos, tuple):
+            infos = list(infos)  # Convert tuple to list
+        elif not isinstance(infos, list):
+            infos = [infos]  # Wrap single item in list
         
         for idx, info in enumerate(infos):
             if info is None:
@@ -110,6 +259,42 @@ class DetailedMetricsCallback(BaseCallback):
                         self.episode_metrics[idx][key] = []
                     if key in info:
                         self.episode_metrics[idx][key].append(info[key])
+            
+            # Debug: Print what type and content info actually has
+            if idx == 0 and self.num_timesteps < 10:  # Only print for first env, first 10 steps
+                print(f"[DEBUG] Step {self.num_timesteps}: info type = {type(info)}")
+                if isinstance(info, dict):
+                    print(f"  info keys = {list(info.keys())[:15]}")
+                    if 'velocity_tracking_error' in info:
+                        print(f"  ✅ velocity_tracking_error FOUND: {info['velocity_tracking_error']:.3f}")
+                    else:
+                        print(f"  ❌ velocity_tracking_error NOT in info dict!")
+                else:
+                    print(f"  ❌ info is not a dict! Value: {info}")
+            
+            # Velocity tracking metrics (NEW)
+            if 'velocity_tracking_error' in info:
+                for key in ['target_velocity_mag', 'actual_velocity_mag', 'velocity_tracking_error']:
+                    if key not in self.episode_metrics[idx]:
+                        self.episode_metrics[idx][key] = []
+                    if key in info:
+                        self.episode_metrics[idx][key].append(info[key])
+                
+                # Also track at rollout level (for continuous logging)
+                self.rollout_velocity_errors.append(info['velocity_tracking_error'])
+                self.rollout_target_mags.append(info['target_velocity_mag'])
+                self.rollout_actual_mags.append(info['actual_velocity_mag'])
+                
+                # Debug: Print first few samples to verify collection
+                if len(self.rollout_velocity_errors) <= 3:
+                    print(f"[VELOCITY DEBUG] Collected sample {len(self.rollout_velocity_errors)}: "
+                          f"target={info['target_velocity_mag']:.3f}, actual={info['actual_velocity_mag']:.3f}, "
+                          f"error={info['velocity_tracking_error']:.3f}")
+                
+                # Debug: Print velocity metrics collection
+                if self.num_timesteps % 500 == 0:  # Print every 500 steps
+                    print(f"[VELOCITY DEBUG] Step {self.num_timesteps}: Target={info['target_velocity_mag']:.3f} m/s, "
+                          f"Actual={info['actual_velocity_mag']:.3f} m/s, Error={info['velocity_tracking_error']:.3f} m/s")
             
             # Track obstacle crashes
             if 'obstacle_crash' in info and info['obstacle_crash']:
@@ -144,11 +329,39 @@ class DetailedMetricsCallback(BaseCallback):
     def _on_rollout_end(self) -> None:
         """
         Called at the end of each rollout (batch collection).
-        Log batch-level crash statistics.
+        Log batch-level crash statistics and velocity tracking stats.
         """
         # Always log, even if batch_episodes is 0 (helps debug SubprocVecEnv issues)
         self.logger.record("debug/callback_active", 1)
         self.logger.record("debug/batch_episodes_seen", self.batch_episodes)
+        
+        # Debug: Print rollout statistics
+        print(f"\n[ROLLOUT END DEBUG] Collected {len(self.rollout_velocity_errors)} velocity samples")
+        if self.rollout_velocity_errors:
+            print(f"  Target velocity: mean={np.mean(self.rollout_target_mags):.3f} m/s, max={np.max(self.rollout_target_mags):.3f} m/s")
+            print(f"  Actual velocity: mean={np.mean(self.rollout_actual_mags):.3f} m/s, max={np.max(self.rollout_actual_mags):.3f} m/s")
+            print(f"  Tracking error:  mean={np.mean(self.rollout_velocity_errors):.3f} m/s, max={np.max(self.rollout_velocity_errors):.3f} m/s")
+        
+        # Log rollout-level velocity statistics (collected every step)
+        if self.rollout_velocity_errors:
+            self.logger.record("velocity/tracking_error_mean", np.mean(self.rollout_velocity_errors))
+            self.logger.record("velocity/tracking_error_max", np.max(self.rollout_velocity_errors))
+            self.logger.record("velocity/tracking_error_std", np.std(self.rollout_velocity_errors))
+            # Clear for next rollout
+            self.rollout_velocity_errors = []
+        
+        if self.rollout_target_mags:
+            self.logger.record("velocity/target_magnitude_mean", np.mean(self.rollout_target_mags))
+            self.logger.record("velocity/target_magnitude_max", np.max(self.rollout_target_mags))
+            # Clear for next rollout
+            self.rollout_target_mags = []
+        
+        if self.rollout_actual_mags:
+            self.logger.record("velocity/actual_magnitude_mean", np.mean(self.rollout_actual_mags))
+            self.logger.record("velocity/actual_magnitude_max", np.max(self.rollout_actual_mags))
+            self.logger.record("velocity/actual_magnitude_std", np.std(self.rollout_actual_mags))
+            # Clear for next rollout
+            self.rollout_actual_mags = []
         
         if self.batch_episodes > 0:
             # Update totals
@@ -226,6 +439,20 @@ class DetailedMetricsCallback(BaseCallback):
             
         if 'waypoints_reached' in metrics:
             self.logger.record("coordinator/waypoints_reached", metrics['waypoints_reached'][-1])
+        
+        # Log velocity tracking metrics (NEW)
+        if 'velocity_tracking_error' in metrics:
+            self.logger.record("velocity/tracking_error_mean", np.mean(metrics['velocity_tracking_error']))
+            self.logger.record("velocity/tracking_error_max", np.max(metrics['velocity_tracking_error']))
+            self.logger.record("velocity/tracking_error_min", np.min(metrics['velocity_tracking_error']))
+            
+        if 'target_velocity_mag' in metrics:
+            self.logger.record("velocity/target_magnitude_mean", np.mean(metrics['target_velocity_mag']))
+            self.logger.record("velocity/target_magnitude_max", np.max(metrics['target_velocity_mag']))
+            
+        if 'actual_velocity_mag' in metrics:
+            self.logger.record("velocity/actual_magnitude_mean", np.mean(metrics['actual_velocity_mag']))
+            self.logger.record("velocity/actual_magnitude_max", np.max(metrics['actual_velocity_mag']))
         
         # Log crash information for this episode
         if metrics.get('obstacle_crash', False):
