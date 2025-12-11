@@ -11,6 +11,13 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt # should be comprehensive, but untested
 
+# Clone and install gym-pybullet-drones
+mkdir simulation
+git clone https://github.com/utiasDSL/gym-pybullet-drones
+
+# Follow installation directions
+# <project_dir>/simulation/gym-pybullet-drones/<gym_base_dir>
+
 # OPTIONAL: Train V4 (car-like control) [MODEL INCLUDED]
 python3 train_v4_system.py
 
