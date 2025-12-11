@@ -1,111 +1,75 @@
-# LLM-Based Search and Rescue Drone System
+# PyBullet Drones - Search and Rescue
 
-CS672 Fundamentals of AI Agents - Final Project
-
-## Overview
-
-Autonomous search and rescue drone system using **gym-pybullet-drones** with LLM-based mission planning and reinforcement learning for drone control.
-
-### System Architecture
-
-![Agent Architecture](res/agent_architecture.png)
-
-The system uses a hierarchical architecture combining high-level strategic planning with low-level control:
-
-- **LLM Planner** (Llama 3.2 1B): Interprets natural language commands and generates structured mission plans using domain-specific tools (grid search, spiral patterns, multi-agent coordination)
-
-- **MDP Evaluator**: Scores mission plans based on coverage, efficiency, safety, and completeness. Provides feedback for training the LLM through transfer learning with LoRA fine-tuning
-
-- **RL Controller**: Executes low-level flight control, translating high-level waypoints into motor commands while processing real-time sensor data (IMU, GPS, altitude)
-
-- **Learning Loop**: Continuously improves the LLM planner by generating diverse missions, scoring them with the MDP evaluator, and fine-tuning the model on high-quality examples
-
-The LLM learns optimal planning strategies through reward feedback from the MDP evaluator—no manual labeling required.
-
-## Features
-
-- **Natural Language Interface**: "Search 4 urban blocks for missing person"
-- **Tool-Augmented LLM**: Grid search, spiral patterns, area division
-- **MDP-Based Evaluation**: Diminishing returns model for sequential decision-making
-- **Transfer Learning**: LoRA fine-tuning with reward-weighted loss
-- **Autonomous Flight**: RL-based low-level control with sensor fusion
-- **Physics Simulation**: PyBullet-based realistic flight dynamics
+Autonomous drone navigation using reinforcement learning with vision-based obstacle avoidance.
 
 ## Quick Start
 
-### LLM Planner
 ```bash
-# Setup environment
-python -m venv .venv
-source .venv/bin/activate  # On Windows: .venv\Scripts\activate
-pip install -r requirements.txt
+# Create venv (if not done already)
+cd <project_directory>
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt # should be comprehensive, but untested
 
-# Test LLM planner
-python test_sar_planner.py
-```
+# Clone and install gym-pybullet-drones
+mkdir simulation
+git clone https://github.com/utiasDSL/gym-pybullet-drones
 
-### RL Simulation Environment
+# Follow installation directions
+# <project_dir>/simulation/gym-pybullet-drones/<gym_base_dir>
 
-**NEW!** Train RL agents in a procedurally generated environment:
+# OPTIONAL: Train V4 (car-like control) [MODEL INCLUDED]
+python3 train_v4_system.py
 
-```bash
-# One-command setup
-./setup_simulation.sh
-
-# Test environment with visualization
-python test_sar_env.py --mode full
-
-# Train RL agent (1M steps)
-python train_sar_agent.py --mode train --timesteps 1000000
-
-# Monitor training
+# OPTIONAL: Monitor training
 tensorboard --logdir ./logs
+
+# Test trained model
+python3 test_v4_system.py --model models/v4_car_control/best/best_model.zip
+
+
 ```
 
-See [`simulation/README.md`](simulation/README.md) for details.
+## Current System: V4 Car-Like Control
 
-**Key Features:**
-- 🎲 **Procedural obstacles** (trees, buildings) - agent can't memorize!
-- 🌲 **Poisson disk sampling** for natural placement
-- 🎯 **Random waypoint navigation**
-- 🧠 **PPO training** with curriculum learning
+**ActionCoordinatorEnvV4** - 2DOF control (forward/backward + yaw)
 
-### Low-Level Velocity Controller
+**Features:**
+- 🚗 Car-like movement (no lateral strafing)
+- 👁️ Stereo vision depth perception (512D)
+- 🎯 Sequential waypoint navigation
+- 🚧 Obstacle avoidance
+- 📏 Fixed altitude flight (1.0m)
 
-**NEW!** 4D body-frame velocity control for precise flight:
+**Action Space (2D):**
+- `vx`: Forward/backward velocity [-2.0, +2.0] m/s
+- `yaw_delta`: Turn rate ±10°/step (480°/sec)
 
-```bash
-# Quick reference
-./quick_ref_4d.sh
+**Observation Space (517D):**
+- Depth map: 512D (32×16 downsampled stereo)
+- Velocity: 2D body frame [vx, vy]
+- Yaw: Current heading
+- Waypoint vector: 2D relative position
 
-# Test environment (no training needed)
-python test_4d_body_frame.py
+**Training:**
+- Algorithm: PPO (Stable-Baselines3)
+- Parallel envs: 8
+- Total steps: 3M
+- Control freq: 48 Hz
 
-# Train velocity controller (200k steps, ~2-3 hours)
-./train_4d_velocity.sh
-
-# Visualize trained model
-python visualize_velocity_control.py --model models/velocity_4d_body_frame_v1/best_model.zip
-```
-
-**Control Architecture:**
-- **dx, dy, dz**: Linear velocity in drone body frame (forward/back, left/right, up/down)
-- **rz**: Yaw rate (rotation about Z-axis)
-- **Observation space**: 11D (reduced from 15D)
-- **Curriculum learning**: Hover → gentle → active movement
-
-See [`BODY_FRAME_CONTROL.md`](BODY_FRAME_CONTROL.md) and [`SETUP_COMPLETE.md`](SETUP_COMPLETE.md) for details.
+## Documentation
+Good luck
 
 ## Technologies
 
-- **LLM**: Llama 3.2 1B Instruct (Meta)
-- **Training**: LoRA (Low-Rank Adaptation), PyTorch, Transformers
 - **Simulation**: PyBullet, gym-pybullet-drones
-- **Vision**: Instance segmentation (planned)
+- **RL**: Stable-Baselines3 (PPO)
+- **Vision**: Stereo depth estimation
+- **Framework**: Gymnasium
 
 ## Citation
 
-This project uses [gym-pybullet-drones](https://github.com/utiasDSL/gym-pybullet-drones). If you use this work, please cite:
+This project uses [gym-pybullet-drones](https://github.com/utiasDSL/gym-pybullet-drones):
 
 ```bibtex
 @INPROCEEDINGS{panerati2021learning,
@@ -117,13 +81,3 @@ This project uses [gym-pybullet-drones](https://github.com/utiasDSL/gym-pybullet
     doi={10.1109/IROS51168.2021.9635857}
 }
 ```
-
-## Future Work
-
-- [x] Plan architecture
-- [ ] LLM planner and MDP evaluation
-- [ ] Transfer learning pipeline
-- [ ] PyBullet integration
-- [ ] Vision system (person detection)
-- [ ] Multi-drone coordination (fleet operations)
-- [ ] Real-world hardware deployment
