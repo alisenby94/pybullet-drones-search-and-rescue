@@ -61,10 +61,10 @@ ipython_config.py
 # Training data and results
 training_data/
 results/
-logs/
+# logs/
 runs/
 checkpoints/
-models/
+# models/
 *.log
 
 # HuggingFace cache
